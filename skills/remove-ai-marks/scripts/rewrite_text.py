@@ -382,9 +382,14 @@ def main() -> int:
         help="Skip Layer A scrub on model output",
     )
     p.add_argument("--json-stats", action="store_true", help="Stats JSON on stderr")
+    p.add_argument(
+        "--force-text",
+        action="store_true",
+        help="Rewrite even when the input looks like a binary container",
+    )
     args = p.parse_args()
 
-    text = read_text_input(args.path)
+    text = read_text_input(args.path, allow_binary=args.force_text)
     allow_remote = (
         args.allow_remote
         if args.allow_remote is not None
