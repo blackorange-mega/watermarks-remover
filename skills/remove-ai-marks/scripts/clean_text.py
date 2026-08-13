@@ -31,13 +31,19 @@ def main() -> int:
     )
     p.add_argument("--stats", action="store_true", help="Print stats JSON to stderr")
     p.add_argument(
+        "--force-text",
+        action="store_true",
+        help="Clean even when the input looks like a binary container "
+        "(this rewrites the bytes and will corrupt the file)",
+    )
+    p.add_argument(
         "--in-place",
         action="store_true",
         help="Overwrite input file (creates .bak backup)",
     )
     args = p.parse_args()
 
-    text = read_text_input(args.path)
+    text = read_text_input(args.path, allow_binary=args.force_text)
     cleaned, stats = clean_text(
         text,
         nfkc=args.nfkc,

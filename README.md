@@ -26,6 +26,19 @@ Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **Ope
 Skill path: [`skills/remove-ai-marks/`](skills/remove-ai-marks/)  
 (migration: formerly `remove-claude-marks`; slash alias `/remove-claude-marks` still documented)
 
+## Desktop app (no terminal needed)
+
+```bash
+python3 gui/launch.py
+```
+
+Or double-click `gui/WatermarksRemover.bat` (Windows) / `gui/watermarks-remover.command` (macOS).
+Drag files in, read the verdict, click clean. Paste text to see hidden characters revealed in
+place. Python 3.10+ stdlib only — no packages to install. Runs on **Windows, macOS and Linux**,
+loopback-only, with every action mapped to the same scripts the CLI calls.
+
+Details: [`gui/README.md`](gui/README.md)
+
 ## Install (agent skill)
 
 ```bash
@@ -76,6 +89,24 @@ python3 "$SCRIPTS/rewrite_text.py" draft.md --backend print-prompt --strength pa
 python3 "$SCRIPTS/inspect_image.py" shot.png
 python3 "$SCRIPTS/clean_image.py" shot.png -o shot.cleaned.png
 ```
+
+### Text tools refuse binary input
+
+`inspect_text.py`, `clean_text.py` and `rewrite_text.py` operate on text. Pointed
+at a `.docx`, `.pdf` or image they used to decode the compressed bytes and report
+whatever codepoints fell out — noise that tracks the compression, not the
+content — and `clean_text.py` then wrote those mangled bytes back, destroying the
+file. They now refuse binary input and name the tool that handles it:
+
+```bash
+python3 "$SCRIPTS/inspect_text.py" report.docx
+# refusing to treat report.docx as text: it looks like a ZIP container (DOCX, ODT, …).
+# Use inspect_file.py / clean_file.py, which route by format,
+# or pass --force-text to scan the raw bytes anyway.
+```
+
+Detection is by magic number plus a control-byte ratio, so text in encodings
+other than UTF-8 keeps working. `--force-text` overrides it everywhere.
 
 ## Optional SynthID pixel scoring
 

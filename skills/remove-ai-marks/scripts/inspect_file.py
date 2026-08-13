@@ -49,6 +49,11 @@ def main() -> int:
         choices=("text", "image", "container", "auto"),
         default="auto",
     )
+    p.add_argument(
+        "--force-text",
+        action="store_true",
+        help="Scan as text even when the bytes look like a binary container",
+    )
     args = p.parse_args()
 
     if not args.path.is_file():
@@ -62,7 +67,7 @@ def main() -> int:
     kind = args.force_type if args.force_type != "auto" else classify(args.path)
 
     if kind == "text":
-        text = read_text_input(str(args.path))
+        text = read_text_input(str(args.path), allow_binary=args.force_text)
         report = inspect_text(text, aggressive=args.aggressive)
         if args.json:
             emit_json({"kind": "text", **report.to_dict()})

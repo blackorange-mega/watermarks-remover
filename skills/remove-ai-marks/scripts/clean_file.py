@@ -10,7 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import MAX_INPUT_BYTES, backup_path, cleaned_path, eprint, safe_write_text  # noqa: E402
+from common import (  # noqa: E402
+    MAX_INPUT_BYTES,
+    backup_path,
+    cleaned_path,
+    eprint,
+    guard_binary,
+    safe_write_text,
+)
 from container_meta import clean_container, detect_container_format  # noqa: E402
 from image_meta import clean_image, detect_format as detect_image_format  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
@@ -68,6 +75,11 @@ def main() -> int:
         choices=("auto", "text", "image", "container"),
         default="auto",
     )
+    p.add_argument(
+        "--force-text",
+        action="store_true",
+        help="Clean as text even when the bytes look like a binary container",
+    )
     args = p.parse_args()
 
     if not args.path.is_file():
@@ -89,7 +101,11 @@ def main() -> int:
         dest = args.output or cleaned_path(args.path)
 
     if kind == "text":
-        text = src.read_text(encoding="utf-8", errors="surrogateescape")
+        raw = src.read_bytes()
+        # classify() falls back to "text" for unrecognised bytes, so an unknown
+        # binary would otherwise be decoded, scrubbed and written back mangled.
+        guard_binary(raw, str(args.path), allow_binary=args.force_text)
+        text = raw.decode("utf-8", errors="surrogateescape")
         cleaned, stats = clean_text(
             text,
             nfkc=args.nfkc,

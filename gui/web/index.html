@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>watermarks-remover</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="2.5" y="2.5" width="19" height="19" rx="1"></rect>
+        <path d="M6 12h4M14 12h4M12 6v4M12 14v4"></path>
+      </svg>
+      <span class="brand-name">watermarks<span class="brand-dash">-</span>remover</span>
+      <span class="brand-tag">local only</span>
+    </div>
+    <div class="topbar-right">
+      <div class="toolstrip" id="toolStrip"></div>
+      <button class="icon-btn" id="keysBtn" type="button" title="Keyboard shortcuts"
+        aria-label="Keyboard shortcuts">⌘</button>
+      <button class="icon-btn" id="themeBtn" type="button" title="Switch light and dark"
+        aria-label="Switch light and dark">◐</button>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="rail" id="rail" role="tablist" aria-label="Sections">
+      <button type="button" class="rail-item is-active" data-view="files"
+        role="tab" aria-selected="true" aria-controls="view-files">
+        <em>01</em><span>Files</span>
+      </button>
+      <button type="button" class="rail-item" data-view="text"
+        role="tab" aria-selected="false" aria-controls="view-text">
+        <em>02</em><span>Text</span>
+      </button>
+      <button type="button" class="rail-item" data-view="rewrite"
+        role="tab" aria-selected="false" aria-controls="view-rewrite">
+        <em>03</em><span>Rewrite</span>
+      </button>
+      <button type="button" class="rail-item" data-view="setup"
+        role="tab" aria-selected="false" aria-controls="view-setup">
+        <em>04</em><span>Setup</span>
+      </button>
+      <button type="button" class="rail-item" data-view="guide"
+        role="tab" aria-selected="false" aria-controls="view-guide">
+        <em>05</em><span>Guide</span>
+      </button>
+      <div class="rail-foot">
+        <span class="rail-note">Nothing leaves<br>this computer.</span>
+      </div>
+    </nav>
+
+    <main class="stage" id="stage">
+
+      <!-- 01 FILES ---------------------------------------------------- -->
+      <section class="view is-active" data-view="files" id="view-files" role="tabpanel"
+        aria-labelledby="tab-files">
+        <div class="view-head">
+          <h1>Files</h1>
+          <p>Scan documents and images for hidden provenance marks, then strip them.</p>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-inner">
+            <svg class="drop-icon" viewBox="0 0 48 48" aria-hidden="true">
+              <path d="M24 32V10M24 10l-8 8M24 10l8 8"></path>
+              <path d="M8 30v6a2 2 0 0 0 2 2h28a2 2 0 0 0 2-2v-6"></path>
+            </svg>
+            <p class="drop-title">Drop files here</p>
+            <p class="drop-sub">PNG · JPEG · PDF · DOCX · ODT · SVG · HTML · Markdown · plain text</p>
+            <div class="drop-actions">
+              <button class="btn btn-primary" id="browseBtn" type="button">Browse…</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="summary" id="summary" hidden>
+          <div class="summary-stats" id="summaryStats"></div>
+          <div class="summary-right">
+            <div class="seg" id="filterSeg" role="group" aria-label="Filter files">
+              <button type="button" class="seg-btn is-active" data-filter="all">All</button>
+              <button type="button" class="seg-btn" data-filter="found">Marks</button>
+              <button type="button" class="seg-btn" data-filter="clean">Clean</button>
+            </div>
+            <button class="btn btn-sm" id="cleanAllBtn" type="button">Clean all</button>
+            <button class="btn btn-sm" id="downloadAllBtn" type="button" hidden>Download all</button>
+            <button class="btn btn-sm btn-quiet" id="clearBtn" type="button">Clear</button>
+          </div>
+          <div class="progress" id="progress" hidden><div class="progress-bar" id="progressBar"></div></div>
+        </div>
+
+        <div class="split" id="filesSplit" hidden>
+          <ul class="file-list" id="fileList" role="listbox" tabindex="0"
+            aria-label="Scanned files"></ul>
+          <div class="detail" id="detail" aria-live="polite"></div>
+        </div>
+
+        <details class="options" id="fileOptions">
+          <summary><span class="label">Advanced options</span></summary>
+          <div class="options-grid">
+            <label class="field">
+              <span class="field-label">Treat file as</span>
+              <select id="optAs">
+                <option value="auto">Detect automatically</option>
+                <option value="text">Plain text</option>
+                <option value="image">Image (PNG / JPEG)</option>
+                <option value="container">Document (PDF, DOCX, …)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">When cleaning, save</span>
+              <select id="optSave">
+                <option value="copy">A cleaned copy next to the original</option>
+                <option value="inplace">Over the original (keeps a .bak)</option>
+                <option value="download">Nothing — just let me download it</option>
+              </select>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="optAggressive">
+              <span>Flag look-alike letters (Cyrillic “а”, Greek “ο”, …)</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="optAggressiveClean">
+              <span>Also replace those letters when cleaning</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="optNfkc">
+              <span>Normalise text (NFKC) — fixes ﬁ, ①, full-width forms</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="optKeepMeta">
+              <span>Images: keep camera metadata, drop only AI / C2PA</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="optScrubDoc">
+              <span>Word / ODT: also strip invisible characters from the document text
+                <em class="sub-note">off by default — the scripts never touch document text</em></span>
+            </label>
+            <label class="check sub">
+              <input type="checkbox" id="optConvertNbsp">
+              <span>…and turn no-break spaces into plain spaces
+                <em class="sub-note">usually deliberate typography (“Table 1”, “p = 0.05”)</em></span>
+            </label>
+            <label class="check" id="synthidRow" hidden>
+              <input type="checkbox" id="optSynthid">
+              <span>Images: score SynthID pixels (slow, needs setup)</span>
+            </label>
+          </div>
+        </details>
+      </section>
+
+      <!-- 02 TEXT ----------------------------------------------------- -->
+      <section class="view" data-view="text" id="view-text" role="tabpanel">
+        <div class="view-head">
+          <h1>Text</h1>
+          <p>Paste anything you copied out of a chat window. Hidden characters show up as chips.</p>
+        </div>
+
+        <div class="verdict" id="textVerdict" aria-live="polite" hidden></div>
+
+        <div class="editor">
+          <div class="editor-bar">
+            <div class="seg" id="textModeSeg" role="group" aria-label="View mode">
+              <button type="button" class="seg-btn is-active" data-mode="edit">Edit</button>
+              <button type="button" class="seg-btn" data-mode="reveal">Reveal</button>
+            </div>
+            <span class="editor-meta" id="textMeta">0 characters</span>
+          </div>
+          <label class="visually-hidden" for="textInput">Text to inspect</label>
+          <textarea id="textInput" class="editor-area" spellcheck="false"
+            placeholder="Paste your text here…"></textarea>
+          <div class="reveal-area" id="revealArea" hidden></div>
+        </div>
+
+        <div class="legend" id="textLegend" hidden></div>
+        <div class="hitlist" id="textHits" hidden></div>
+
+        <div class="actionbar">
+          <button class="btn btn-primary" id="textCleanBtn" type="button">Clean text</button>
+          <button class="btn" id="textCopyBtn" type="button">Copy</button>
+          <button class="btn" id="textDownloadBtn" type="button">Download .txt</button>
+          <button class="btn btn-quiet" id="textClearBtn" type="button">Clear</button>
+          <span class="actionbar-gap"></span>
+          <label class="check inline">
+            <input type="checkbox" id="textNfkc"><span>NFKC</span>
+          </label>
+          <label class="check inline">
+            <input type="checkbox" id="textAggressive"><span>Look-alike letters</span>
+          </label>
+        </div>
+      </section>
+
+      <!-- 03 REWRITE -------------------------------------------------- -->
+      <section class="view" data-view="rewrite" id="view-rewrite" role="tabpanel">
+        <div class="view-head">
+          <h1>Rewrite <span class="head-badge">Layer B</span></h1>
+          <p>Statistical watermarks live in word choice itself, so the only way out is rewording.</p>
+        </div>
+
+        <div class="notice">
+          <strong>Best effort, and it costs you something.</strong>
+          Removing a token-sampling watermark means rewriting a large share of the text, which
+          replaces your wording with the rewriting model’s. No tool can certify that the result
+          passes a vendor’s detector — including this one.
+        </div>
+
+        <div class="two-col">
+          <div class="col">
+            <label class="field">
+              <span class="field-label">Text to rewrite</span>
+              <textarea id="rwInput" class="editor-area standalone" spellcheck="false"
+                placeholder="Paste the text…"></textarea>
+            </label>
+          </div>
+          <div class="col col-narrow">
+            <label class="field">
+              <span class="field-label">Approach</span>
+              <select id="rwStrength">
+                <option value="paraphrase">Paraphrase — different wording, same shape</option>
+                <option value="humanize">Humanize — rewrite as if written from scratch</option>
+                <option value="backtranslate">Back-translate — through another language</option>
+                <option value="structural">Structural — outline, then rewrite</option>
+                <option value="code">Code — comments, strings and local names</option>
+              </select>
+            </label>
+
+            <div class="field-row" id="rwLangRow" hidden>
+              <label class="field">
+                <span class="field-label">Pivot language</span>
+                <input type="text" id="rwLang" value="French">
+              </label>
+              <label class="field">
+                <span class="field-label">Back to</span>
+                <input type="text" id="rwOriginalLang" value="English">
+              </label>
+            </div>
+
+            <label class="field">
+              <span class="field-label">Who does the rewriting</span>
+              <select id="rwBackend">
+                <option value="print-prompt">Nobody — just give me the prompt</option>
+                <option value="ollama">Ollama on this machine</option>
+                <option value="openai-compatible">OpenAI-compatible endpoint</option>
+              </select>
+            </label>
+
+            <div id="rwModelBox" hidden>
+              <div class="field-row">
+                <label class="field">
+                  <span class="field-label">Model</span>
+                  <input type="text" id="rwModel" placeholder="llama3.2" list="rwModelList">
+                  <datalist id="rwModelList"></datalist>
+                </label>
+                <label class="field field-slim">
+                  <span class="field-label">Temp.</span>
+                  <input type="number" id="rwTemp" value="0.9" min="0" max="2" step="0.1">
+                </label>
+              </div>
+              <label class="field">
+                <span class="field-label">Endpoint</span>
+                <input type="text" id="rwBaseUrl" value="http://127.0.0.1:11434">
+              </label>
+              <div class="field-row">
+                <label class="field field-slim">
+                  <span class="field-label">Tries</span>
+                  <input type="number" id="rwCandidates" value="1" min="1" max="8" step="1">
+                </label>
+                <label class="field field-slim">
+                  <span class="field-label">Timeout s</span>
+                  <input type="number" id="rwTimeout" value="120" min="5" max="1800" step="5">
+                </label>
+                <button class="btn btn-sm btn-test" id="rwProbeBtn" type="button">Test</button>
+              </div>
+              <label class="field" id="rwKeyRow" hidden>
+                <span class="field-label">API key <span class="hint">memory only, never saved</span></span>
+                <input type="password" id="rwApiKey" autocomplete="off">
+              </label>
+              <label class="check">
+                <input type="checkbox" id="rwAllowRemote">
+                <span>Allow a non-local endpoint — <strong>your text leaves this machine</strong></span>
+              </label>
+              <div class="probe-result" id="rwProbe" hidden></div>
+            </div>
+
+            <label class="check">
+              <input type="checkbox" id="rwLayerA" checked>
+              <span>Strip invisible characters from the result too</span>
+            </label>
+
+            <button class="btn btn-primary btn-block" id="rwRunBtn" type="button">Rewrite</button>
+          </div>
+        </div>
+
+        <div class="result-panel" id="rwResult" hidden>
+          <div class="result-head">
+            <span class="label" id="rwResultLabel">Result</span>
+            <div class="result-actions">
+              <button class="btn btn-sm" id="rwCopyBtn" type="button">Copy</button>
+              <button class="btn btn-sm" id="rwDownloadBtn" type="button">Download</button>
+            </div>
+          </div>
+          <div class="readout" id="rwReadout"></div>
+          <pre class="result-body" id="rwOutput"></pre>
+        </div>
+      </section>
+
+      <!-- 04 SETUP ---------------------------------------------------- -->
+      <section class="view" data-view="setup" id="view-setup" role="tabpanel">
+        <div class="view-head">
+          <h1>Setup</h1>
+          <p>What this machine can do right now, and how to unlock the rest.</p>
+        </div>
+        <div id="setupBody" class="setup-body"></div>
+        <div class="actionbar">
+          <button class="btn" id="setupRefresh" type="button">Re-check</button>
+          <button class="btn btn-quiet" id="quitBtn" type="button">Quit app</button>
+        </div>
+      </section>
+
+      <!-- 05 GUIDE ---------------------------------------------------- -->
+      <section class="view" data-view="guide" id="view-guide" role="tabpanel">
+        <div class="view-head">
+          <h1>Guide</h1>
+          <p>The project’s own notes on what can and cannot be removed.</p>
+        </div>
+        <div class="guide-layout">
+          <ul class="doc-list" id="docList"></ul>
+          <article class="doc-body" id="docBody"></article>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <div class="modal" id="keysModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+      <div class="modal-head">
+        <span class="label">Keyboard</span>
+        <button class="icon-btn" id="keysClose" type="button" aria-label="Close">×</button>
+      </div>
+      <dl class="keys">
+        <dt><kbd>1</kbd>–<kbd>5</kbd></dt><dd>Switch section</dd>
+        <dt><kbd>Ctrl</kbd><kbd>O</kbd></dt><dd>Browse for files</dd>
+        <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move through the file list</dd>
+        <dt><kbd>Enter</kbd></dt><dd>Clean the selected file</dd>
+        <dt><kbd>Ctrl</kbd><kbd>Enter</kbd></dt><dd>Clean every file in the list</dd>
+        <dt><kbd>R</kbd></dt><dd>Toggle Reveal in the Text screen</dd>
+        <dt><kbd>?</kbd></dt><dd>This list</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+<script src="/assets/app.js"></script>
+</body>
+</html>
