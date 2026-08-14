@@ -11,14 +11,15 @@
 | ODT meta:generator | Scrub `meta.xml` | `clean_file.py` | Loses generator tag | Yes |
 | HTML generator / JSON-LD provenance | Strip tags | `clean_file.py` | Loses meta | Yes |
 | Markdown AI frontmatter keys | Drop keys | `clean_file.py` | Loses YAML keys | Yes |
-| Pixel / audio / video watermarks (SynthID-media) | — | Out of scope | — | — |
+| Pixel image watermark (SynthID-media / StegaStamp / Tree-Ring / StableSignature) | CtrlRegen regeneration (external backend) | `clean_ctrlregen.py` / `clean_image.py --remove-pixel ctrlregen` | Regenerates pixels; heavy compute; detail drift at higher strength | No without official detector; reverse-SynthID score is a local surrogate |
+| Audio / video watermarks (SynthID-media) | — | Out of scope | — | — |
 | C2PA soft binding (in-content link to manifest) | — | Out of scope (survives our metadata strip) | — | Vendor detector only |
 | Data-driven model backdoors | — | Out of scope | — | — |
 
 ## Default pipeline
 
 1. **Inspect** (`inspect_file.py` or specific inspect_*).
-2. **Deterministic clean** — Layer A text and/or container/image metadata.
+2. **Deterministic clean** — Layer A text and/or container/image metadata; for images, optionally add pixel removal (`--remove-pixel ctrlregen`) after the metadata strip.
 3. **Always offer Layer B** rewrite for prose (paraphrase → optional strong pass: `humanize` / back-translate / structural).
 4. Prefer a **non-origin, open-weight** rewrite model when available (avoid re-stamping).
 5. Layer A again after rewrite.

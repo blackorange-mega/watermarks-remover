@@ -10,6 +10,8 @@ _ _ _ ____ ___ ____ ____ _  _ ____ ____ _  _ ____    ____ ____ _  _ ____ _  _ __
 
 [![CI](https://github.com/guillaumemeyer/watermarks-remover/actions/workflows/ci.yml/badge.svg)](https://github.com/guillaumemeyer/watermarks-remover/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/releases)
+[![Stars](https://img.shields.io/github/stars/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/stargazers)
+[![Forks](https://img.shields.io/github/forks/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/forks)
 
 Agent skill + stdlib Python scripts to strip **multi-vendor AI provenance marks** from text and files — for privacy and hygiene on content **you own**.
 
@@ -21,7 +23,7 @@ Agent skill + stdlib Python scripts to strip **multi-vendor AI provenance marks*
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style marks.
 
-**Latest release:** [v0.3.2](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.3.2)
+**Latest release:** [v0.4.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.4.0)
 
 Skill path: [`skills/remove-ai-marks/`](skills/remove-ai-marks/)  
 (migration: formerly `remove-claude-marks`; slash alias `/remove-claude-marks` still documented)
@@ -158,6 +160,86 @@ V4 scoring uses `artifacts/spectral_codebook_v4.npz` from the upstream checkout
 (~220 MB). This is **detection/scoring only** — it does not remove pixel
 watermarks.
 
+## Optional CtrlRegen pixel removal
+
+For **pixel-domain** image watermarks (SynthID-class, StegaStamp, Tree-Ring,
+StableSignature), an optional external backend runs the CtrlRegen pipeline
+(ControlNet + DINOv2 IP-Adapter controllable regeneration). The backend is
+[`mertizci/noai-watermark`](https://github.com/mertizci/noai-watermark), a
+maintained reimplementation of the ICLR 2025
+[CtrlRegen](https://arxiv.org/abs/2410.05470) method with automatic tiling.
+
+The backend is **not bundled** and ships no LICENSE file, so it is treated as
+all-rights-reserved: it is cloned at a pinned commit and loaded at runtime.
+
+### Bootstrap
+
+```bash
+SCRIPTS=skills/remove-ai-marks/scripts
+
+# Clones upstream (pinned commit), creates a venv, installs torch + deps.
+"$SCRIPTS/setup_ctrlregen.sh"
+
+# Standalone removal (default checkout: ~/noai-watermark).
+NOAI_WATERMARK_DIR=~/noai-watermark \
+~/noai-watermark/.venv/bin/python "$SCRIPTS/clean_ctrlregen.py" shot.png -o shot.ctrlregen.png
+```
+
+### From `clean_image.py`
+
+```bash
+NOAI_WATERMARK_DIR=~/noai-watermark \
+~/noai-watermark/.venv/bin/python "$SCRIPTS/clean_image.py" shot.png \
+  -o shot.cleaned.png --remove-pixel ctrlregen
+```
+
+Order of operations: metadata strip first, then CtrlRegen pixel removal, then
+an optional reverse-SynthID before/after score (when `REVERSE_SYNTHID_DIR` is
+also set).
+
+**Strength is conservative by default** (`--ctrlregen-strength 0.25`), because
+higher strength removes more watermark but regenerates more of the image.
+Documented presets: `0.15` minimal / `0.25` default / `0.35` balanced /
+`0.5` aggressive / `0.7` max (backend default is 0.5). `--ctrlregen-steps`
+defaults to 50 (effective denoising steps ≈ steps × strength).
+
+### Image size (512×512 native limit)
+
+CtrlRegen is a 512×512 Stable Diffusion 1.5 ControlNet. The backend resolves
+this for arbitrary inputs, so no extra tiling is exposed here:
+
+- **≤512 px:** single pass — center-crop/resize to 512, regenerate, resize back.
+- **>512 px:** automatic overlapping tiling (512 px tiles, 192 px overlap),
+  width/height aligned to multiples of 8, then cosine-blended seams.
+- **Either path:** output is resized to the original size and color-matched to
+  the original image.
+
+Very large images (e.g. 4K) produce many tiles, so runs scale with tile count
+(slower and higher VRAM). Pre-downscale large inputs when practical; tile size
+and overlap are hardcoded upstream and are not exposed as flags.
+
+### Compute, gated models, and verification
+
+Expect ~10 GB of model downloads; a GPU is strongly recommended and CPU runs
+are slow. Some upstream models are gated, so export `HF_TOKEN` (env only —
+never argv). `clean_ctrlregen.py` refuses to auto-install dependencies; run
+`setup_ctrlregen.sh` first.
+
+There is no local detector for StegaStamp/Tree-Ring/StableSignature, so the
+only local signal is the reverse-SynthID score (a surrogate). When available,
+`clean_image.py --remove-pixel ctrlregen` reports that score before/after; the
+official Google SynthID check remains the final authority.
+
+### Docker
+
+```bash
+make docker-ctrlregen-build
+docker run --rm -e HF_TOKEN="$HF_TOKEN" \
+  --user "$(id -u):$(id -g)" \
+  -v "$(pwd):/data" \
+  watermarks-remover-ctrlregen /data/shot.png -o /data/shot.ctrlregen.png
+```
+
 ## Coverage matrix
 
 | Channel | Claude | Gemini/SynthID | OpenAI | Open-LLM |
@@ -165,7 +247,7 @@ watermarks.
 | Unicode / edit-based text | Layer A | Layer A | Layer A | Layer A |
 | Statistical sampling text | Layer B best-effort | Layer B best-effort | Layer B if present | Layer B best-effort |
 | C2PA / file metadata | Yes (listed formats) | Yes when present | Yes when present | Yes when present |
-| Pixel image marks | Out of scope | Optional SynthID score (external); removal out of scope | Out of scope | Out of scope |
+| Pixel image marks | Out of scope | Optional SynthID score + CtrlRegen removal (external) | Out of scope | Optional CtrlRegen removal (external) |
 | Training backdoors | Out of scope | Out of scope | Out of scope | Out of scope |
 
 Details: [`skills/remove-ai-marks/references/vendor-notes.md`](skills/remove-ai-marks/references/vendor-notes.md), [`mark-classes.md`](skills/remove-ai-marks/references/mark-classes.md).
@@ -219,7 +301,7 @@ Layer B makes sense when you specifically want the premium model's **thinking an
 | HTML | meta, JSON-LD, data-ai* | Strip tags/attrs |
 | Markdown | YAML frontmatter AI keys | Drop keys + Layer A body |
 
-Pixel-domain watermark **removal** and **C2PA soft binding** (in-content watermark that can re-link a remote Content Credentials manifest after metadata is stripped) remain **out of scope**. Stripping hard-bound C2PA does **not** clear those channels. An optional local SynthID scorer is available for detection only (see above).
+Pixel-domain watermark **removal** is now available as an optional external CtrlRegen backend (see above); it is a regenerating remover, not a guarantee. **C2PA soft binding** (in-content watermark that can re-link a remote Content Credentials manifest after metadata is stripped) remains **out of scope**. Stripping hard-bound C2PA does **not** clear those channels.
 
 ### Residual risk after a clean
 
@@ -230,7 +312,7 @@ To check residual signals yourself (optional, external):
 | Channel | What we remove | What may remain | External check (examples) |
 | --- | --- | --- | --- |
 | Hard-bound C2PA / EXIF / XMP | Yes | Soft-bound / pixel marks | [c2patool](https://github.com/contentauth/c2pa-rs/tree/main/cli), [Content Credentials verify](https://contentcredentials.org/verify) |
-| SynthID-class media | No (optional local score only) | Pixel/audio/video watermark | Provider tools (e.g. [Google SynthID](https://deepmind.google/science/synthid/) / Vertex detector where offered); optional local [reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) scorer |
+| SynthID-class media | Optional pixel removal (external CtrlRegen); local score otherwise | Audio/video watermark; residual pixel watermark after removal | Provider tools (e.g. [Google SynthID](https://deepmind.google/science/synthid/) / Vertex detector where offered); optional local [reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) scorer |
 | Statistical text | Best-effort rewrite | Strong marks after light edit | No public universal detector; vendor tools when available |
 
 Industry two-layer context (C2PA + imperceptible watermark): [Institute of AI PM guide](https://www.institutepm.com/knowledge-hub/ai-content-provenance-watermarking).
@@ -244,13 +326,16 @@ Industry two-layer context (C2PA + imperceptible watermark): [Institute of AI PM
 | Unicode scrub (Layer A) | ZWSP, bidi, tags, exotic spaces, … | Safe default for text |
 | Rewrite (Layer B) | Statistical token marks (best-effort) | Always offered by skill; costs style — see [Disclaimer](#disclaimer-what-removing-a-text-watermark-costs) |
 | Container/metadata strip | File provenance | See format table |
+| CtrlRegen pixel removal (optional) | Pixel-domain image marks (SynthID-class, StegaStamp, Tree-Ring, StableSignature) | External backend; heavy compute; conservative strength default |
 | Open-weight local models | Avoid re-stamping with origin model | Operational alternative |
 
 Matrix: [`skills/remove-ai-marks/references/removal-matrix.md`](skills/remove-ai-marks/references/removal-matrix.md).
 
-## Ethics
+## Ethics and disclaimer
 
 See [`skills/remove-ai-marks/references/ethics.md`](skills/remove-ai-marks/references/ethics.md). For privacy and research on **your** content — not academic fraud or false “human-written” claims.
+
+**Responsible use:** This project is for content you own or are authorized to process. Users must adhere to local regulations and use it responsibly. The developers disclaim any liability for potential misuse by users.
 
 ## Tests
 
@@ -261,6 +346,39 @@ make smoke                          # quick CLI smoke on fixtures
 ```
 
 ## Changelog
+
+### [v0.4.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.4.0) — pixel removal, finding confidence, Windows & false-positive fixes
+
+**Optional CtrlRegen pixel removal (external backend)**
+
+- Optional pixel-domain watermark removal via an external `mertizci/noai-watermark` checkout: `clean_ctrlregen.py` adapter + `setup_ctrlregen.sh` bootstrap (pinned commit, sparse checkout, venv, SHA verification), plus `Dockerfile.ctrlregen` and `make bootstrap-ctrlregen` / `docker-ctrlregen-build` / `smoke-ctrlregen`
+- `clean_image.py --remove-pixel ctrlregen` runs metadata strip → CtrlRegen removal → optional reverse-SynthID before/after score; `inspect_image.py` hints at the flag on a high SynthID score
+- Conservative default strength `0.25` (presets 0.15/0.25/0.35/0.5/0.7); the 512×512-native pipeline is auto-tiled by the backend for larger images; the torch subprocess gets higher env-overridable resource caps
+- Backend is never bundled: `noai-watermark` ships no LICENSE file (treated as all-rights-reserved), and its auto-install/restart code paths are bypassed by using `CtrlRegenEngine` directly
+
+**Finding confidence and aggregate audits**
+
+- Findings are now classified `confirmed` / `probable` / `informational` / `likely_false_positive`, exposed in text/image/container JSON and human reports
+- New `audit_dir.py` (recursive tree) and `audit_website.py` (sitemap discovery + crawl) aggregate reports; documented in SKILL.md
+
+**False-positive fixes**
+
+- DOCX: scan only `docProps`/`customXml`, not the visible body (#14)
+- Text Layer A: preserve emoji `VS16`/`ZWJ` after an emoji base; new `--strip-emoji-glue` paranoid flag (#22)
+- HTML: treat CMS generator tags as informational, not AI metadata (#13)
+- PDF: exclude stream payloads from the AI-marker byte scan (#13)
+- Inspect reports note unsupported/best-effort paths
+
+**Windows support**
+
+- Gate POSIX-only `preexec_fn` and `os.fchmod` so writes and optional tools run on Windows (#15, #23)
+- Reconfigure stdio to UTF-8 so redirected Windows streams no longer raise on invisible Unicode; Windows CI leg + CLI smoke run (#23)
+
+**Docs and supply chain**
+
+- README CtrlRegen section + research references (CtrlRegen, UnMarker, forensic-stealth caveat), responsible-use disclaimer; SKILL/matrix/vendor-notes/ethics updates
+- Dependabot config + security-path CODEOWNERS; bump scipy/numpy/opencv-python/scikit-learn/pywavelets and the base image to Python 3.14-slim
+- Mock-based CtrlRegen tests (no torch in CI)
 
 ### [v0.3.2](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.3.2) — security hardening (safe writes, HTTP client, CI supply chain)
 
@@ -316,16 +434,6 @@ make smoke                          # quick CLI smoke on fixtures
 - Multi-vendor docs (Claude, Gemini/SynthID-class, OpenAI, open-LLM)
 - Stdlib-first scripts; optional `c2patool` / `exiftool`
 
-## Star History
-
-<a href="https://www.star-history.com/?repos=guillaumemeyer%2Fwatermarks-remover&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=guillaumemeyer/watermarks-remover&type=date&theme=dark&legend=top-left&sealed_token=OLC1f1vbYBuk_xFR_ZH94jbC46Ci9cOhtXLcLIel7gnWVpQu7g-92es0u5d7IV2249FGEO6O7upS8xR_EGk_CwkVXq5yhS77M6zI5hMF7byS4eL6q1-cHU2IOPvUIJ7L3ZqBsV1GVGyXRIzHfeJJxBVBjD9mY0aQcrnUl6dmDf7laUcwYm188_SL_ZfK" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=guillaumemeyer/watermarks-remover&type=date&legend=top-left&sealed_token=OLC1f1vbYBuk_xFR_ZH94jbC46Ci9cOhtXLcLIel7gnWVpQu7g-92es0u5d7IV2249FGEO6O7upS8xR_EGk_CwkVXq5yhS77M6zI5hMF7byS4eL6q1-cHU2IOPvUIJ7L3ZqBsV1GVGyXRIzHfeJJxBVBjD9mY0aQcrnUl6dmDf7laUcwYm188_SL_ZfK" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=guillaumemeyer/watermarks-remover&type=date&legend=top-left&sealed_token=OLC1f1vbYBuk_xFR_ZH94jbC46Ci9cOhtXLcLIel7gnWVpQu7g-92es0u5d7IV2249FGEO6O7upS8xR_EGk_CwkVXq5yhS77M6zI5hMF7byS4eL6q1-cHU2IOPvUIJ7L3ZqBsV1GVGyXRIzHfeJJxBVBjD9mY0aQcrnUl6dmDf7laUcwYm188_SL_ZfK" />
- </picture>
-</a>
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
@@ -340,4 +448,9 @@ MIT — see [LICENSE](LICENSE).
 - Zhang et al., [*Watermarks in the Sand: Impossibility of Strong Watermarking for Generative Models*](https://arxiv.org/abs/2311.04378) (ICML 2024)
 - [google-deepmind/synthid-text](https://github.com/google-deepmind/synthid-text) (research reference; not used for detection here)
 - [aloshdenny/reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) (research reference)
+- Liu et al., [*Image Watermarks are Removable Using Controllable Regeneration from Clean Noise*](https://arxiv.org/abs/2410.05470) (ICLR 2025) — the pixel-regeneration method the optional CtrlRegen backend implements — [code](https://github.com/yepengliu/CtrlRegen)
+- Kassis & Hengartner, [*UnMarker: A Universal Attack on Defensive Image Watermarking*](https://arxiv.org/abs/2405.08363) (arXiv:2405.08363; IEEE S&P 2025) — a universal watermark attack compared on a different metric than CtrlRegen
+- Goonatilake & Ateniese, [*Removing the Watermark Is Not Enough: Forensic Stealth in Generative-AI Watermark Removal*](https://arxiv.org/abs/2605.09203) (arXiv:2605.09203) — motivates the conservative-strength default: removal can still leave forensic traces
+- [mertizci/noai-watermark](https://github.com/mertizci/noai-watermark) (CLI/Python toolkit for SynthID/StableSignature/TreeRing removal and AI metadata stripping)
+- [0xROOTPLS/DeSynth](https://github.com/0xROOTPLS/DeSynth) (SynthID removal for OpenAI/Google images)
 - Institute of AI PM, [*AI Content Provenance and Watermarking: The PM's Guide to C2PA and SynthID*](https://www.institutepm.com/knowledge-hub/ai-content-provenance-watermarking) (two-layer industry model: C2PA + imperceptible watermark / soft binding; SB 942 / EU AI Act Art. 50 context)

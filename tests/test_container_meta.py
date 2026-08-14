@@ -58,6 +58,39 @@ def test_html_meta_strip():
     assert any("drop" in a for a in actions)
 
 
+def test_html_cms_generator_not_ai():
+    html = '<meta name="generator" content="WordPress 6.0">'
+    has_c2pa, has_ai, findings, _ = inspect_html(html)
+    assert not has_c2pa
+    assert not has_ai
+    assert any("cms" in f for f in findings)
+
+
+def test_html_cms_generator_preserved_by_clean():
+    html = '<html><head><meta name="generator" content="WordPress 6.0"><meta name="viewport" content="width=device-width"></head></html>'
+    cleaned, actions = clean_html(html)
+    assert "WordPress" in cleaned
+    assert "viewport" in cleaned
+
+
+def test_html_ai_generator_still_dropped():
+    html = '<meta name="generator" content="Claude">'
+    cleaned, actions = clean_html(html)
+    assert "Claude" not in cleaned
+    assert any("drop" in a for a in actions)
+
+
+def test_pdf_stream_byte_collision_not_ai(tmp_path: Path):
+    from container_meta import inspect_pdf
+
+    pdf = b"%PDF-1.4\n1 0 obj<< /Length 4 >>stream\nAIGC\nendstream\nendobj\n%%EOF\n"
+    src = tmp_path / "collision.pdf"
+    src.write_bytes(pdf)
+    has_c2pa, has_ai, findings, _ = inspect_pdf(src, pdf)
+    assert not has_c2pa
+    assert not has_ai
+
+
 def test_svg_metadata():
     svg = b"""<?xml version="1.0"?>
 <svg xmlns="http://www.w3.org/2000/svg">
@@ -110,6 +143,50 @@ def test_docx_strips_app_and_customxml(tmp_path: Path):
         assert not any(n.startswith("customXml/") for n in names)
         app = zf.read("docProps/app.xml").decode()
         assert "Claude" not in app
+
+
+def _make_docx_with_body_text(body_text: str = "Claude wrote this.") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+</Types>""",
+        )
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+            + body_text
+            + "</w:t></w:r></w:p></w:body></w:document>",
+        )
+        zf.writestr(
+            "docProps/core.xml",
+            '<?xml version="1.0"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"></cp:coreProperties>',
+        )
+    return buf.getvalue()
+
+
+def test_docx_body_vendor_word_is_not_ai_metadata():
+    from container_meta import inspect_docx
+
+    data = _make_docx_with_body_text()
+    has_c2pa, has_ai, findings, _ = inspect_docx(data)
+    assert not has_c2pa
+    assert not has_ai
+    assert not any("Claude" in f for f in findings)
+
+
+def test_docx_metadata_vendor_word_is_still_flagged():
+    from container_meta import inspect_docx
+
+    data = _make_docx_with_app("Claude AI Writer")
+    has_c2pa, has_ai, findings, _ = inspect_docx(data)
+    assert has_ai
+    assert any("Claude" in f for f in findings)
 
 
 def _make_odt(generator: str = "Anthropic Claude") -> bytes:

@@ -24,6 +24,11 @@ def main() -> int:
         help="Also flag Latin confusable / fullwidth lookalikes",
     )
     p.add_argument(
+        "--strip-emoji-glue",
+        action="store_true",
+        help="Flag emoji presentation selectors/ZWJ even after an emoji base (paranoid)",
+    )
+    p.add_argument(
         "--force-text",
         action="store_true",
         help="Scan even when the input looks like a binary container",
@@ -31,7 +36,11 @@ def main() -> int:
     args = p.parse_args()
 
     text = read_text_input(args.path, allow_binary=args.force_text)
-    report = inspect_text(text, aggressive=args.aggressive)
+    report = inspect_text(
+        text,
+        aggressive=args.aggressive,
+        strip_emoji_glue=args.strip_emoji_glue,
+    )
     if args.json:
         emit_json(report.to_dict())
     else:

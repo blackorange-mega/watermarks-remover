@@ -15,6 +15,7 @@ from common import (  # noqa: E402
     backup_path,
     cleaned_path,
     eprint,
+    ROUTER_ADVICE,
     guard_binary,
     safe_write_text,
 )
@@ -92,6 +93,19 @@ def main() -> int:
 
     kind = args.force_type if args.force_type != "auto" else classify(args.path)
 
+    # classify() falls back to "text" for unrecognised bytes, so an unknown
+    # binary would otherwise be decoded, scrubbed and written back mangled.
+    # Sniff before --in-place takes a backup: refusing afterwards would leave a
+    # .bak sidecar behind for a file this run never touches.
+    raw = args.path.read_bytes() if kind == "text" else None
+    if raw is not None:
+        guard_binary(
+            raw,
+            str(args.path),
+            allow_binary=args.force_text,
+            advice=ROUTER_ADVICE,
+        )
+
     if args.in_place:
         bak = backup_path(args.path)
         dest = args.path
@@ -101,10 +115,6 @@ def main() -> int:
         dest = args.output or cleaned_path(args.path)
 
     if kind == "text":
-        raw = src.read_bytes()
-        # classify() falls back to "text" for unrecognised bytes, so an unknown
-        # binary would otherwise be decoded, scrubbed and written back mangled.
-        guard_binary(raw, str(args.path), allow_binary=args.force_text)
         text = raw.decode("utf-8", errors="surrogateescape")
         cleaned, stats = clean_text(
             text,

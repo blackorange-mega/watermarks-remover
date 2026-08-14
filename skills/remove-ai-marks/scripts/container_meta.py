@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from common import safe_arg, safe_write_bytes, safe_write_text, subprocess_rlimits, which
+from common import classify_finding_confidence, safe_arg, safe_write_bytes, safe_write_text, subprocess_preexec_fn, which
 from image_meta import AI_META_HINTS, C2PA_MARKERS, run_optional_tools
 
 # Frontmatter / meta keys that often carry AI provenance
@@ -66,6 +66,7 @@ class ContainerInspectReport:
     findings: list[str] = field(default_factory=list)
     tools: dict[str, Any] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -74,8 +75,12 @@ class ContainerInspectReport:
             "has_c2pa": self.has_c2pa,
             "has_ai_metadata": self.has_ai_metadata,
             "findings": self.findings,
+            "findings_confidence": [
+                classify_finding_confidence(f) for f in self.findings
+            ],
             "tools": self.tools,
             "details": self.details,
+            "notes": self.notes,
         }
 
 
@@ -224,9 +229,33 @@ _META_TAG_RE = re.compile(
     re.I,
 )
 _META_ATTR_RE = re.compile(
-    r"""(?:name|property|content|generator)\s*=\s*["']([^"']*)["']""",
+    r"""(name|property|content|generator)\s*=\s*["']([^"']*)["']""",
     re.I,
 )
+
+# Known AI vendor names for the "generator" meta tag. A plain CMS generator
+# (WordPress, Elementor) is CMS provenance, not AI-generator metadata.
+_GENERATOR_AI_RE = re.compile(
+    r"claude|anthropic|openai|chatgpt|gemini|synthid|copilot|midjourney|dall.?e|stable.?diffusion",
+    re.I,
+)
+
+
+def _meta_attrs(tag: str) -> dict[str, str]:
+    return dict(_META_ATTR_RE.findall(tag))
+
+
+def _is_cms_generator_meta(tag: str) -> bool:
+    """Return True for a generator meta tag that is CMS provenance, not AI."""
+    attrs = _meta_attrs(tag)
+    name_or_prop = (
+        attrs.get("name") or attrs.get("property") or attrs.get("generator") or ""
+    ).lower()
+    if name_or_prop != "generator":
+        return False
+    if _GENERATOR_AI_RE.search(attrs.get("content", "")) or _GENERATOR_AI_RE.search(tag):
+        return False
+    return True
 _JSONLD_RE = re.compile(
     r"<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>.*?</script>",
     re.I | re.DOTALL,
@@ -238,13 +267,16 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
     has_ai = False
     has_c2pa = False
     for tag in _META_TAG_RE.findall(text):
+        if re.search(r"c2pa|content.?credential", tag, re.I):
+            has_c2pa = True
+        if _is_cms_generator_meta(tag):
+            findings.append(f"info: cms generator: {tag[:120]}")
+            continue
         if AI_META_NAME_RE.search(tag) or any(
             h.decode("ascii", "ignore").lower() in tag.lower() for h in AI_META_HINTS[:12]
         ):
             has_ai = True
             findings.append(f"meta: {tag[:120]}")
-            if re.search(r"c2pa|content.?credential", tag, re.I):
-                has_c2pa = True
     for m in _JSONLD_RE.finditer(text):
         blob = m.group(0)
         if AI_META_NAME_RE.search(blob) or re.search(
@@ -266,6 +298,8 @@ def clean_html(text: str) -> tuple[str, list[str]]:
 
     def _meta_sub(m: re.Match[str]) -> str:
         tag = m.group(0)
+        if _is_cms_generator_meta(tag):
+            return tag
         if AI_META_NAME_RE.search(tag) or re.search(
             r"generator|claude|anthropic|openai|gemini|synthid|c2pa|aigc", tag, re.I
         ):
@@ -398,6 +432,11 @@ def _check_zip_budget(info: zipfile.ZipInfo, budget: list[int]) -> None:
         )
 
 
+def _is_docx_meta_part(name: str) -> bool:
+    """Return True for DOCX parts that carry provenance, not visible content."""
+    return name.startswith(("docProps/", "customXml/"))
+
+
 def inspect_docx(data: bytes) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_c2pa = False
@@ -409,14 +448,20 @@ def inspect_docx(data: bytes) -> tuple[bool, bool, list[str], dict]:
             parts = zf.namelist()
             for info in zf.infolist():
                 _check_zip_budget(info, budget)
-                raw = zf.read(info.filename)
+                name = info.filename
+                # Only metadata/provenance parts carry AI markers. The visible
+                # body (word/*.xml) may legitimately mention vendor names such
+                # as "Claude" without being AI-generated metadata.
+                if not _is_docx_meta_part(name):
+                    continue
+                raw = zf.read(name)
                 c2, ai, hits = _blob_hits(raw)
                 if c2 or ai:
                     if c2:
                         has_c2pa = True
                     if ai:
                         has_ai = True
-                    findings.append(f"{info.filename}: {', '.join(hits[:6])}")
+                    findings.append(f"{name}: {', '.join(hits[:6])}")
             # always flag customXml presence lightly
             custom = [n for n in parts if n.startswith("customXml/")]
             if custom:
@@ -591,17 +636,41 @@ def clean_odt(data: bytes) -> tuple[bytes, list[str]]:
 # PDF
 # ---------------------------------------------------------------------------
 
+_XMP_PACKET_RE = re.compile(
+    rb"<\?xpacket begin.*?<\?xpacket end[^?]*\?>",
+    re.I | re.DOTALL,
+)
+
+
+def _pdf_structured_blob(data: bytes) -> bytes:
+    """Return PDF bytes with stream payloads removed, plus XMP packets.
+
+    Stream payloads are often compressed binary where an AI-marker byte
+    sequence (e.g. "AIGC") can occur by chance. Scanning only dictionaries and
+    XMP packets avoids treating those collisions as metadata findings.
+    """
+    no_streams = re.sub(
+        rb"stream\r?\n.*?endstream",
+        b"stream endstream",
+        data,
+        flags=re.DOTALL,
+    )
+    xmp = b"\n".join(_XMP_PACKET_RE.findall(data))
+    return no_streams + b"\n" + xmp
+
+
 def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
-    has_c2pa, has_ai, hits = _blob_hits(data)
-    findings.extend(f"pdf-bytes:{h}" for h in hits)
+    has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
+    findings.extend(f"pdf-structured:{h}" for h in hits)
     # XMP packet scan
-    if b"<x:xmpmeta" in data or b"application/rdf+xml" in data:
+    xmp_blob = b"\n".join(_XMP_PACKET_RE.findall(data))
+    if xmp_blob:
         findings.append("XMP packet present")
         has_ai = has_ai or bool(
             re.search(
                 rb"digitalSourceType|trainedAlgorithmicMedia|SoftwareAgent|c2pa",
-                data,
+                xmp_blob,
                 re.I,
             )
         )
@@ -634,7 +703,7 @@ def clean_pdf(path: Path, dest: Path) -> tuple[list[str], dict]:
                 text=True,
                 timeout=60,
                 check=False,
-                preexec_fn=subprocess_rlimits,
+                preexec_fn=subprocess_preexec_fn,
             )
             actions.append(f"exiftool -all= (rc={r.returncode})")
         except Exception as e:
@@ -694,6 +763,15 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         has_c2pa, has_ai, findings, details = inspect_markdown(text)
     else:
         has_c2pa, has_ai, findings = False, False, [f"unsupported container: {fmt}"]
+        details = {"unsupported": True}
+
+    notes: list[str] = []
+    if fmt == "pdf":
+        notes.append("PDF inspection is best-effort; exiftool/c2patool give more reliable metadata detection")
+    elif fmt == "docx":
+        notes.append("DOCX: only metadata/provenance parts are scanned; visible body text is ignored")
+    if "unsupported" in details:
+        notes.append(f"format not fully inspected: {fmt}")
 
     if fmt in ("svg", "pdf", "docx") and not tools:
         tools = run_optional_tools(path)
@@ -706,6 +784,7 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         findings=findings,
         tools=tools,
         details=details,
+        notes=notes,
     )
 
 

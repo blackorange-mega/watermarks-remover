@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -18,12 +21,23 @@ jobs:
           python-version: "3.12"
 
       - name: Install test deps
-        run: python3 -m pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements-dev.txt
 
       - name: Test
-        run: python3 -m pytest -q
+        run: python -m pytest -q
+
+      - name: Smoke (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python skills/remove-ai-marks/scripts/clean_text.py tests/fixtures/sample_watermarked.txt -o "$env:TEMP/wm.cleaned.txt" --stats &&
+          python skills/remove-ai-marks/scripts/rewrite_text.py tests/fixtures/sample_watermarked.txt --backend print-prompt > $null &&
+          python skills/remove-ai-marks/scripts/clean_file.py tests/fixtures/sample_ai.md -o "$env:TEMP/sample_ai.cleaned.md" &&
+          python skills/remove-ai-marks/scripts/clean_file.py tests/fixtures/sample_ai.html -o "$env:TEMP/sample_ai.cleaned.html" &&
+          python skills/remove-ai-marks/scripts/clean_file.py tests/fixtures/sample_meta.svg -o "$env:TEMP/sample_meta.cleaned.svg"
 
       - name: Audit dependencies (pip-audit)
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          python3 -m pip_audit -r requirements-dev.txt \
+          python -m pip_audit -r requirements-dev.txt \
             -r skills/remove-ai-marks/scripts/requirements-synthid-scorer.txt

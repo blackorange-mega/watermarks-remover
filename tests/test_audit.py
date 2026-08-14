@@ -1,0 +1,169 @@
+"""Tests for finding confidence and aggregate audit scripts."""
+
+from __future__ import annotations
+
+import gzip
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from audit_lib import aggregate, is_actionable, scan_file  # noqa: E402
+from audit_website import guess_kind, inspect_remote, parse_sitemap  # noqa: E402
+from common import classify_finding_confidence  # noqa: E402
+from container_meta import inspect_container  # noqa: E402
+from text_unicode import inspect_text  # noqa: E402
+
+
+def test_classify_finding_confidence_buckets():
+    cases = {
+        "c2patool reports a C2PA-related manifest": "confirmed",
+        "PNG chunk caBX (possible C2PA container)": "confirmed",
+        "JPEG APP11 segment (JUMBF/C2PA common)": "confirmed",
+        "pdf-structured:ai:digitalSourceType": "confirmed",
+        "pdf-structured:ai:AIGC": "probable",
+        "PNG tEXt: c2pa, contentcredentials": "probable",
+        "frontmatter key: generator": "probable",
+        "info: cms generator: <meta name=\"generator\" content=\"WordPress\">": "informational",
+        "customXml parts: 1": "informational",
+        "unsupported container: woff2": "informational",
+        "svg <metadata> present": "informational",
+        "byte-scan C2PA markers: c2pa": "likely_false_positive",
+    }
+    for finding, expected in cases.items():
+        assert classify_finding_confidence(finding) == expected, finding
+
+
+def test_text_report_hit_confidence():
+    report = inspect_text("a\u200bb")
+    assert report.to_dict()["hits"][0]["confidence"] == "probable"
+
+    # Exotic space homoglyphs are weaker context.
+    report = inspect_text("a\u2003b")
+    assert report.to_dict()["hits"][0]["confidence"] == "informational"
+
+
+def test_container_report_findings_confidence(tmp_path: Path):
+    src = tmp_path / "cms.html"
+    src.write_text(
+        '<html><head><meta name="generator" content="WordPress 6.0"></head></html>',
+        encoding="utf-8",
+    )
+    report = inspect_container(src)
+    assert report.to_dict()["findings_confidence"] == ["informational"]
+
+
+def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(ctype)
+    crc = zlib.crc32(payload, crc) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + ctype + payload + struct.pack(">I", crc)
+
+
+def _minimal_png_with_text() -> bytes:
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x00\x00")
+    text = b"Comment\x00c2pa contentcredentials"
+    return (
+        sig
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"tEXt", text)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def test_image_report_findings_confidence(tmp_path: Path):
+    from image_meta import inspect_image
+
+    src = tmp_path / "t.png"
+    src.write_bytes(_minimal_png_with_text())
+    report = inspect_image(src)
+    d = report.to_dict()
+    assert "findings_confidence" in d
+    assert any(c in ("probable", "confirmed") for c in d["findings_confidence"])
+
+
+def test_scan_file_text_and_html(tmp_path: Path):
+    text = tmp_path / "a.txt"
+    text.write_text("Hello\u200bWorld\n", encoding="utf-8")
+    item = scan_file(text)
+    assert item["kind"] == "text"
+    assert is_actionable(item)
+
+    html = tmp_path / "b.html"
+    html.write_text(
+        '<html><head><meta name="generator" content="WordPress"></head><body>ok</body></html>',
+        encoding="utf-8",
+    )
+    item = scan_file(html)
+    assert item["kind"] == "html"
+    assert not is_actionable(item)
+
+
+def test_aggregate_summary():
+    files = [
+        {
+            "path": "a.txt",
+            "kind": "text",
+            "has_c2pa": False,
+            "has_ai_metadata": False,
+            "suspicious_total": 1,
+            "findings": ["layer-a [zwj_family] U+200B ZERO WIDTH SPACE (Cf) x1"],
+            "confidence": ["probable"],
+        },
+        {
+            "path": "b.html",
+            "kind": "html",
+            "has_c2pa": False,
+            "has_ai_metadata": False,
+            "suspicious_total": 0,
+            "findings": ["info: cms generator: <meta>"],
+            "confidence": ["informational"],
+        },
+    ]
+    summary = aggregate(files)
+    assert summary["total"] == 2
+    assert summary["actionable_files"] == 1
+    assert summary["findings_by_confidence"]["probable"] == 1
+    assert summary["findings_by_confidence"]["informational"] == 1
+    assert summary["with_suspicious_text"] == 1
+
+
+def test_parse_sitemap_urlset_and_index():
+    data = (
+        b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        b'<url><loc>https://x.test/a</loc></url></urlset>'
+    )
+    kind, urls = parse_sitemap(data)
+    assert kind == "urlset"
+    assert urls == ["https://x.test/a"]
+
+    idx = (
+        b'<sitemapindex><sitemap><loc>https://x.test/s1.xml</loc></sitemap>'
+        b"</sitemapindex>"
+    )
+    assert parse_sitemap(idx) == ("sitemapindex", ["https://x.test/s1.xml"])
+
+    assert parse_sitemap(gzip.compress(data))[0] == "urlset"
+
+
+def test_guess_kind():
+    assert guess_kind("https://x.test/a", b"<html>x</html>", "text/html") == "html"
+    assert guess_kind("https://x.test/a.png", b"\x89PNG\r\n\x1a\n", None) == "png"
+    assert guess_kind("https://x.test/a", b"%PDF-1.4", None) == "pdf"
+
+
+def test_inspect_remote_html_cms_informational():
+    result = inspect_remote(
+        "https://x.test/page",
+        b'<html><head><meta name="generator" content="WordPress"></head><body>hi</body></html>',
+        "text/html",
+    )
+    assert result["kind"] == "html"
+    assert result["confidence"] == ["informational"]
+    assert not is_actionable(result)

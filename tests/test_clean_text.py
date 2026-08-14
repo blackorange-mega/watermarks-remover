@@ -64,3 +64,56 @@ def test_aggressive_confusable():
     raw = "p\u0430y"  # p + cyrillic a + y
     cleaned, _ = clean_text(raw, aggressive_homoglyphs=True)
     assert cleaned == "pay"
+
+
+def test_clean_preserves_emoji_vs16():
+    raw = "Balance returns. \u2696\ufe0f"  # ⚖️
+    cleaned, stats = clean_text(raw)
+    assert cleaned == raw
+    assert stats["removed_count"] == 0
+
+
+def test_clean_preserves_zwj_family():
+    raw = "Family time: \U0001F468\u200D\U0001F469\u200D\U0001F467"  # 👨‍👩‍👧
+    cleaned, stats = clean_text(raw)
+    assert cleaned == raw
+    assert stats["removed_count"] == 0
+
+
+def test_clean_preserves_zwj_chain():
+    raw = "\u2764\ufe0f\u200d\U0001F525"  # ❤️‍🔥
+    cleaned, stats = clean_text(raw)
+    assert cleaned == raw
+    assert stats["removed_count"] == 0
+
+
+def test_clean_strips_floating_emoji_glue():
+    raw = "a\u200db\ufe0f"
+    cleaned, stats = clean_text(raw)
+    assert cleaned == "ab"
+    assert stats["removed_count"] == 2
+
+
+def test_inspect_emoji_glue_not_suspicious_by_default():
+    raw = "Balance returns. \u2696\ufe0f Family time: \U0001F468\u200D\U0001F469\u200D\U0001F467"
+    report = inspect_text(raw)
+    assert report.suspicious_total == 0
+
+
+def test_inspect_floating_emoji_glue_is_suspicious():
+    raw = "a\u200d"
+    report = inspect_text(raw)
+    assert report.suspicious_total >= 1
+
+
+def test_clean_strip_emoji_glue_flag():
+    raw = "\u2696\ufe0f"
+    cleaned, stats = clean_text(raw, strip_emoji_glue=True)
+    assert cleaned == "\u2696"
+    assert stats["removed_count"] == 1
+
+
+def test_inspect_strip_emoji_glue_flag():
+    raw = "\u2696\ufe0f"
+    report = inspect_text(raw, strip_emoji_glue=True)
+    assert report.suspicious_total >= 1

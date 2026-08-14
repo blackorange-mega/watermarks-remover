@@ -29,6 +29,11 @@ def main() -> int:
         action="store_true",
         help="Do not rewrite exotic spaces to U+0020",
     )
+    p.add_argument(
+        "--strip-emoji-glue",
+        action="store_true",
+        help="Strip emoji presentation selectors/ZWJ even after an emoji base (paranoid)",
+    )
     p.add_argument("--stats", action="store_true", help="Print stats JSON to stderr")
     p.add_argument(
         "--force-text",
@@ -49,6 +54,7 @@ def main() -> int:
         nfkc=args.nfkc,
         aggressive_homoglyphs=args.aggressive_homoglyphs,
         normalize_spaces=not args.no_normalize_spaces,
+        strip_emoji_glue=args.strip_emoji_glue,
     )
 
     out = args.output

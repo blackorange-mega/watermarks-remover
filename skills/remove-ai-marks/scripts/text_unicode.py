@@ -215,11 +215,71 @@ def _strip_kind(cp: int) -> str:
     return "strip"
 
 
+# Emoji presentation glue: zero-width joiner and text/emoji variation
+# selectors. These are invisible carriers when free-floating, but after an
+# emoji base they are part of the visible sequence (⚖️, 👨‍👩‍👧, ❤️‍🔥) and
+# stripping them visibly alters the text.
+EMOJI_GLUE_CODEPOINTS: frozenset[int] = frozenset({0x200D, 0xFE0E, 0xFE0F})
+
+
+def _is_emoji_glue(cp: int) -> bool:
+    return cp in EMOJI_GLUE_CODEPOINTS
+
+
+def _is_emoji_base(cp: int) -> bool:
+    """Return True for characters that can start or continue an emoji sequence."""
+    if 0x1F000 <= cp <= 0x1FAFF:
+        return True
+    if 0x2600 <= cp <= 0x27BF:  # misc symbols / dingbats / arrows
+        return True
+    if 0x2B00 <= cp <= 0x2BFF:  # misc symbols and arrows
+        return True
+    if cp in (0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299):
+        return True
+    if cp in (0x0023, 0x002A) or 0x0030 <= cp <= 0x0039:  # keycap bases
+        return True
+    return False
+
+
+def _decide(
+    ch: str,
+    prev_kept: str | None,
+    *,
+    normalize_spaces: bool,
+    treat_confusables: bool,
+    strip_emoji_glue: bool,
+) -> tuple[str, str, str | None]:
+    """Classify one input char for both inspect and clean.
+
+    Returns ``(action, out_char, kind)`` where action is ``keep``, ``strip``
+    or ``replace``; out_char is the surviving character for keep/replace; and
+    kind is the inspect classification (None when not suspicious).
+    """
+    cp = ord(ch)
+    if _is_emoji_glue(cp) and not strip_emoji_glue:
+        if prev_kept is not None and _is_emoji_base(ord(prev_kept)):
+            return ("keep", ch, None)
+    if _is_strip_cp(cp):
+        return ("strip", "", _strip_kind(cp))
+    if normalize_spaces and cp in SPACE_HOMOGLYPHS:
+        return ("replace", SPACE_HOMOGLYPHS[cp], "space")
+    if treat_confusables and cp in LATIN_CONFUSABLES:
+        return ("replace", LATIN_CONFUSABLES[cp], "confusable")
+    if unicodedata.category(ch) == "Cf" and cp not in SPACE_HOMOGLYPHS:
+        return ("strip", "", "other_cf")
+    return ("keep", ch, None)
+
+
 def _char_label(ch: str) -> str:
     cp = ord(ch)
     name = unicodedata.name(ch, "UNKNOWN")
     cat = unicodedata.category(ch)
     return f"U+{cp:04X} {name} ({cat})"
+
+
+def _hit_confidence(kind: str) -> str:
+    """Layer A hits are edit-based carriers; space homoglyphs are weaker context."""
+    return "informational" if kind == "space" else "probable"
 
 
 @dataclass
@@ -249,6 +309,7 @@ class TextInspectReport:
                     "label": h.label,
                     "count": h.count,
                     "kind": h.kind,
+                    "confidence": _hit_confidence(h.kind),
                     "sample_offsets": h.samples[:10],
                 }
                 for h in self.hits
@@ -257,26 +318,33 @@ class TextInspectReport:
         }
 
 
-def inspect_text(text: str, *, aggressive: bool = False) -> TextInspectReport:
+def inspect_text(
+    text: str,
+    *,
+    aggressive: bool = False,
+    strip_emoji_glue: bool = False,
+) -> TextInspectReport:
     buckets: dict[tuple[int, str], list[int]] = {}
+    prev_kept: str | None = None
     for i, ch in enumerate(text):
-        cp = ord(ch)
-        kind: str | None = None
-        if _is_strip_cp(cp):
-            kind = _strip_kind(cp)
-        elif cp in SPACE_HOMOGLYPHS:
-            kind = "space"
-        elif aggressive and cp in LATIN_CONFUSABLES:
-            kind = "confusable"
-        else:
-            cat = unicodedata.category(ch)
-            # Other format chars not already listed
-            if cat == "Cf" and cp not in (0x00AD,):
-                kind = "other_cf"
+        action, out_char, kind = _decide(
+            ch,
+            prev_kept,
+            normalize_spaces=True,
+            treat_confusables=aggressive,
+            strip_emoji_glue=strip_emoji_glue,
+        )
         if kind is None:
+            # Kept; emoji glue does not advance the "previous kept" base so
+            # ZWJ chains (❤️‍🔥) continue to bind correctly.
+            if not _is_emoji_glue(ord(ch)):
+                prev_kept = out_char
             continue
-        key = (cp, kind)
+        key = (ord(ch), kind)
         buckets.setdefault(key, []).append(i)
+        if action == "replace":
+            prev_kept = out_char
+        # strip: prev_kept unchanged
 
     hits: list[CharHit] = []
     total = 0
@@ -298,9 +366,13 @@ def inspect_text(text: str, *, aggressive: bool = False) -> TextInspectReport:
         "Layer A only: invisible/format Unicode and space homoglyphs (edit-based carriers).",
         "Statistical (token-sampling) watermarks are not detectable here; use Layer B rewrite.",
         "Inspect kinds: strip, bidi, tag_chars, variation_selector, zwj_family, space, confusable, other_cf.",
+        "Emoji presentation glue (ZWJ/VS15/VS16 after an emoji base) is preserved by default; use --strip-emoji-glue for paranoid mode.",
     ]
     if not hits:
-        notes.append("No suspicious Unicode characters found.")
+        notes.append(
+            "No deterministic Layer A (invisible Unicode/format) carriers detected; "
+            "statistical and pixel-domain marks are out of scope here."
+        )
     return TextInspectReport(length=len(text), suspicious_total=total, hits=hits, notes=notes)
 
 
@@ -310,30 +382,35 @@ def clean_text(
     nfkc: bool = False,
     aggressive_homoglyphs: bool = False,
     normalize_spaces: bool = True,
+    strip_emoji_glue: bool = False,
 ) -> tuple[str, dict]:
     """Return cleaned text and a stats dict."""
     removed: Counter[str] = Counter()
     replaced: Counter[str] = Counter()
     out_chars: list[str] = []
+    prev_kept: str | None = None
 
     for ch in text:
-        cp = ord(ch)
-        if _is_strip_cp(cp):
-            removed[_char_label(ch)] += 1
-            continue
-        if normalize_spaces and cp in SPACE_HOMOGLYPHS:
+        action, out_char, _kind = _decide(
+            ch,
+            prev_kept,
+            normalize_spaces=normalize_spaces,
+            treat_confusables=aggressive_homoglyphs,
+            strip_emoji_glue=strip_emoji_glue,
+        )
+        if action == "keep":
+            out_chars.append(out_char)
+            # Emoji glue does not advance the "previous kept" base, so a
+            # ZWJ chain (❤️‍🔥) stays bound to its original emoji base.
+            if not _is_emoji_glue(ord(ch)):
+                prev_kept = out_char
+        elif action == "replace":
+            out_chars.append(out_char)
             replaced[_char_label(ch)] += 1
-            out_chars.append(SPACE_HOMOGLYPHS[cp])
-            continue
-        if aggressive_homoglyphs and cp in LATIN_CONFUSABLES:
-            replaced[_char_label(ch)] += 1
-            out_chars.append(LATIN_CONFUSABLES[cp])
-            continue
-        # Other Cf: strip by default for hygiene
-        if unicodedata.category(ch) == "Cf" and cp not in SPACE_HOMOGLYPHS:
+            prev_kept = out_char
+        else:  # strip
             removed[_char_label(ch)] += 1
-            continue
-        out_chars.append(ch)
+            # prev_kept unchanged
 
     result = "".join(out_chars)
     if nfkc:
@@ -363,7 +440,10 @@ def human_report(report: TextInspectReport) -> str:
     if report.hits:
         lines.append("Hits:")
         for h in report.hits:
-            lines.append(f"  [{h.kind}] {h.label} x{h.count} @ {h.samples[:5]}")
+            lines.append(
+                f"  [{h.kind}/{_hit_confidence(h.kind)}] "
+                f"{h.label} x{h.count} @ {h.samples[:5]}"
+            )
     for n in report.notes:
         lines.append(f"Note: {n}")
     return "\n".join(lines)

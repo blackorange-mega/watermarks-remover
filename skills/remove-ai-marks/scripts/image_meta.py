@@ -13,9 +13,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common import safe_arg, safe_write_bytes, subprocess_rlimits, which
+from common import classify_finding_confidence, safe_arg, safe_write_bytes, subprocess_preexec_fn, which
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+
+# CtrlRegen is torch-based and needs far more address space than the stdlib
+# parsers. The invoking clean_image.py subprocess applies these higher,
+# env-overridable caps instead of the default child limits in common.py.
+_CTRLREGEN_RLIMIT_AS = int(os.environ.get("WATERMARKS_CTRLREGEN_RLIMIT_AS", str(32 << 30)))
+_CTRLREGEN_RLIMIT_FSIZE = int(os.environ.get("WATERMARKS_CTRLREGEN_RLIMIT_FSIZE", str(2 << 30)))
+
+
+def ctrlregen_preexec_fn() -> None:
+    """Higher resource caps for the CtrlRegen subprocess (torch memory)."""
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (_CTRLREGEN_RLIMIT_AS, _CTRLREGEN_RLIMIT_AS))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (_CTRLREGEN_RLIMIT_FSIZE, _CTRLREGEN_RLIMIT_FSIZE))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
+ctrlregen_subprocess_preexec_fn = ctrlregen_preexec_fn if os.name == "posix" else None
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 JPEG_SOI = b"\xff\xd8"
@@ -63,6 +83,7 @@ class ImageInspectReport:
     findings: list[str] = field(default_factory=list)
     tools: dict[str, Any] = field(default_factory=dict)
     synthid: dict[str, Any] | None = None
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -71,8 +92,12 @@ class ImageInspectReport:
             "has_c2pa": self.has_c2pa,
             "has_ai_metadata": self.has_ai_metadata,
             "findings": self.findings,
+            "findings_confidence": [
+                classify_finding_confidence(f) for f in self.findings
+            ],
             "tools": self.tools,
             "synthid": self.synthid,
+            "notes": self.notes,
         }
 
 
@@ -201,7 +226,7 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                preexec_fn=subprocess_rlimits,
+                preexec_fn=subprocess_preexec_fn,
             )
             out = (r.stdout or "") + (r.stderr or "")
             low = out.lower()
@@ -232,7 +257,7 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                preexec_fn=subprocess_rlimits,
+                preexec_fn=subprocess_preexec_fn,
             )
             out = r.stdout or ""
             interesting = [
@@ -284,7 +309,7 @@ def run_synthid_score(
             capture_output=True,
             text=True,
             timeout=180,
-            preexec_fn=subprocess_rlimits,
+            preexec_fn=subprocess_preexec_fn,
         )
     except Exception as e:
         return {"available": False, "error": str(e)}
@@ -299,6 +324,89 @@ def run_synthid_score(
         return {"available": False, "error": f"bad scorer JSON: {e}"}
 
 
+def _ctrlregen_python(upstream: Path) -> str:
+    """Prefer the checkout venv so torch/diffusers are importable."""
+    if os.name == "nt":
+        venv = upstream / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv = upstream / ".venv" / "bin" / "python"
+    if venv.is_file():
+        return str(venv)
+    return sys.executable
+
+
+def run_ctrlregen_clean(
+    path: Path,
+    output: Path,
+    *,
+    upstream_dir: str | None = None,
+    strength: float = 0.25,
+    steps: int = 50,
+    device: str | None = None,
+    seed: int | None = None,
+    timeout: int = 3600,
+) -> dict[str, Any]:
+    """Run the optional CtrlRegen remover in a subprocess.
+
+    Returns ``{"available": False, "error": ...}`` when the remover is not
+    configured, its dependencies are missing, or it fails at runtime; a
+    successful run is ``{"available": True, ...}``.
+    """
+    if upstream_dir is None:
+        upstream_dir = os.environ.get("NOAI_WATERMARK_DIR")
+    if not upstream_dir:
+        return {
+            "available": False,
+            "error": "CtrlRegen not configured (set NOAI_WATERMARK_DIR or pass --ctrlregen-dir)",
+        }
+
+    upstream = Path(upstream_dir).expanduser().resolve()
+    if not upstream.is_dir():
+        return {"available": False, "error": f"CtrlRegen dir not found: {upstream}"}
+
+    script = SCRIPTS_DIR / "clean_ctrlregen.py"
+    cmd = [
+        _ctrlregen_python(upstream),
+        str(script),
+        str(path),
+        "-o",
+        str(output),
+        "--upstream-dir",
+        str(upstream),
+        "--strength",
+        str(strength),
+        "--steps",
+        str(steps),
+        "--json",
+    ]
+    if device:
+        cmd += ["--device", str(device)]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            preexec_fn=ctrlregen_subprocess_preexec_fn,
+        )
+    except subprocess.TimeoutExpired:
+        return {"available": False, "error": f"CtrlRegen timed out after {timeout}s"}
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+    if r.returncode != 0:
+        return {"available": False, "error": (r.stderr or "").strip()[:2000]}
+    try:
+        payload = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError as e:
+        return {"available": False, "error": f"bad CtrlRegen adapter JSON: {e}"}
+    payload["available"] = True
+    return payload
+
+
 def inspect_image(
     path: Path,
     synthid_dir: str | None = None,
@@ -311,6 +419,10 @@ def inspect_image(
         has_c2pa, has_ai, findings = inspect_jpeg(data)
     else:
         has_c2pa, has_ai, findings = False, False, ["unsupported format (MVP: PNG/JPEG)"]
+
+    notes: list[str] = []
+    if fmt == "unknown":
+        notes.append("format not fully inspected; only PNG/JPEG are supported")
 
     tools = run_optional_tools(path)
     # Elevate flags from tools
@@ -327,6 +439,7 @@ def inspect_image(
         findings=findings,
         tools=tools,
         synthid=run_synthid_score(path, synthid_dir),
+        notes=notes,
     )
 
 
@@ -476,6 +589,13 @@ def clean_image(
     *,
     strip_all_metadata: bool = True,
     synthid_dir: str | None = None,
+    remove_pixel: str | None = None,
+    ctrlregen_dir: str | None = None,
+    ctrlregen_strength: float = 0.25,
+    ctrlregen_steps: int = 50,
+    ctrlregen_device: str | None = None,
+    ctrlregen_seed: int | None = None,
+    ctrlregen_timeout: int = 3600,
 ) -> dict[str, Any]:
     synthid_before = run_synthid_score(path, synthid_dir)
     data = path.read_bytes()
@@ -503,11 +623,33 @@ def clean_image(
                 text=True,
                 timeout=60,
                 check=False,
-                preexec_fn=subprocess_rlimits,
+                preexec_fn=subprocess_preexec_fn,
             )
             actions.append("exiftool -all= pass")
         except Exception as e:
             actions.append(f"exiftool failed: {e}")
+
+    pixel_removal: dict[str, Any] | None = None
+    if remove_pixel:
+        if remove_pixel != "ctrlregen":
+            raise ValueError(f"unknown pixel remover: {remove_pixel}")
+        pixel_removal = run_ctrlregen_clean(
+            dest,
+            dest,
+            upstream_dir=ctrlregen_dir,
+            strength=ctrlregen_strength,
+            steps=ctrlregen_steps,
+            device=ctrlregen_device,
+            seed=ctrlregen_seed,
+            timeout=ctrlregen_timeout,
+        )
+        if pixel_removal.get("available"):
+            actions.append(f"CtrlRegen pixel removal (strength {ctrlregen_strength})")
+        else:
+            actions.append(
+                "CtrlRegen pixel removal skipped: "
+                f"{pixel_removal.get('error', 'unknown error')}"
+            )
 
     after = inspect_image(dest, synthid_dir=synthid_dir)
     return {
@@ -522,4 +664,5 @@ def clean_image(
         "post_findings": after.findings,
         "synthid_before": synthid_before,
         "synthid_after": after.synthid,
+        "pixel_removal": pixel_removal,
     }

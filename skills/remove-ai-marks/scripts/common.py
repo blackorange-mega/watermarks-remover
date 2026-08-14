@@ -26,6 +26,31 @@ def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
+def _reconfigure_stream(stream: Any, errors: str) -> None:
+    """Switch a std stream to UTF-8 when it supports reconfiguration.
+
+    On Windows, redirected stdin/stdout/stderr default to the ANSI codepage
+    (e.g. cp1252), which cannot encode/decode the invisible Unicode
+    characters this tool exists to remove. UTF-8 covers every codepoint, so
+    text writes stop raising and piped input matches the file-path handling.
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8", errors=errors)
+        except (OSError, ValueError):
+            pass
+
+
+def _configure_stdio() -> None:
+    _reconfigure_stream(sys.stdin, "surrogateescape")
+    _reconfigure_stream(sys.stdout, "backslashreplace")
+    _reconfigure_stream(sys.stderr, "backslashreplace")
+
+
+_configure_stdio()
+
+
 # Containers that get mistaken for text on the command line. Decoding one as
 # text walks compressed bytes and reports whatever codepoints fall out of them:
 # noise that tracks the compression, not the content. Worse, cleaning such a
@@ -87,7 +112,28 @@ def looks_binary(data: bytes) -> str | None:
     return None
 
 
-def guard_binary(data: bytes, origin: str, *, allow_binary: bool = False) -> None:
+# Advice for the text-only scripts: another tool in this repo handles the file.
+TEXT_TOOL_ADVICE = (
+    "Use inspect_file.py / clean_file.py, which route by format,",
+    "or pass --force-text to scan the raw bytes anyway.",
+)
+
+# Advice for the routers themselves. They *are* inspect_file.py / clean_file.py,
+# and classify() has already ruled out every known container, so pointing back
+# at them would be circular.
+ROUTER_ADVICE = (
+    "These bytes match no supported text, image or container format.",
+    "Pass --force-text to handle them as text anyway, or --as to force a format.",
+)
+
+
+def guard_binary(
+    data: bytes,
+    origin: str,
+    *,
+    allow_binary: bool = False,
+    advice: tuple[str, ...] | None = None,
+) -> None:
     """Refuse binary input for the text-only tools unless explicitly overridden."""
     if allow_binary:
         return
@@ -95,14 +141,19 @@ def guard_binary(data: bytes, origin: str, *, allow_binary: bool = False) -> Non
     if kind is None:
         return
     eprint(f"refusing to treat {origin} as text: it looks like {kind}.")
-    eprint("Use inspect_file.py / clean_file.py, which route by format,")
-    eprint("or pass --force-text to scan the raw bytes anyway.")
+    for line in advice or TEXT_TOOL_ADVICE:
+        eprint(line)
     raise SystemExit(2)
 
 
-def read_text_input(path: str | None, *, allow_binary: bool = False) -> str:
+def read_text_input(
+    path: str | None,
+    *,
+    allow_binary: bool = False,
+    advice: tuple[str, ...] | None = None,
+) -> str:
     if path is None or path == "-":
-        return _read_stdin_capped(allow_binary=allow_binary)
+        return _read_stdin_capped(allow_binary=allow_binary, advice=advice)
     p = Path(path)
     try:
         size = p.stat().st_size
@@ -112,29 +163,59 @@ def read_text_input(path: str | None, *, allow_binary: bool = False) -> str:
         eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {path}")
         raise SystemExit(2)
     data = p.read_bytes()
-    guard_binary(data, str(path), allow_binary=allow_binary)
+    guard_binary(data, str(path), allow_binary=allow_binary, advice=advice)
     return data.decode("utf-8", errors="surrogateescape")
 
 
-def _read_stdin_capped(*, allow_binary: bool = False) -> str:
-    """Read stdin with a hard cap (uncapped stdin was a memory-DoS hole)."""
-    chunks: list[str] = []
+def _read_stdin_capped(
+    *,
+    allow_binary: bool = False,
+    advice: tuple[str, ...] | None = None,
+) -> str:
+    """Read stdin with a hard cap (uncapped stdin was a memory-DoS hole).
+
+    Read the raw byte stream rather than the decoded text, so the binary sniff
+    sees the real octets. Going through the text layer first makes detection
+    depend on the console codec: under cp1252 a PNG's leading 0x89 comes back
+    as 0xe2 0x80 0xb0 and the magic number is gone before we look. That the
+    decode is UTF-8 today is only true while _configure_stdio() succeeds, and
+    its reconfigure() is deliberately best-effort.
+    """
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        # A replaced or non-binary stdin (pytest capture, custom harness).
+        # Fall back to the text layer; the sniff is then codec-dependent.
+        text = sys.stdin.read()
+        if len(text.encode("utf-8", errors="surrogateescape")) > MAX_STDIN_BYTES:
+            eprint(f"refusing stdin input larger than {MAX_STDIN_BYTES} bytes")
+            raise SystemExit(2)
+        guard_binary(
+            text[:BINARY_SNIFF_BYTES].encode("utf-8", errors="surrogateescape"),
+            "stdin",
+            allow_binary=allow_binary,
+            advice=advice,
+        )
+        return text
+
+    chunks: list[bytes] = []
     total = 0
-    checked = False
     while True:
-        chunk = sys.stdin.read(1 << 20)
+        chunk = stream.read(1 << 20)
         if not chunk:
             break
+        if not chunks:
+            guard_binary(
+                chunk[:BINARY_SNIFF_BYTES],
+                "stdin",
+                allow_binary=allow_binary,
+                advice=advice,
+            )
         total += len(chunk)
         if total > MAX_STDIN_BYTES:
             eprint(f"refusing stdin input larger than {MAX_STDIN_BYTES} bytes")
             raise SystemExit(2)
         chunks.append(chunk)
-        if not checked:
-            checked = True
-            head = chunk[:BINARY_SNIFF_BYTES].encode("utf-8", errors="surrogateescape")
-            guard_binary(head, "stdin", allow_binary=allow_binary)
-    return "".join(chunks)
+    return b"".join(chunks).decode("utf-8", errors="surrogateescape")
 
 
 def write_text_output(text: str, path: str | None) -> None:
@@ -222,9 +303,105 @@ def subprocess_rlimits() -> None:
         pass
 
 
+# subprocess.run(preexec_fn=...) is POSIX-only; on Windows the argument
+# itself raises ValueError before the callable runs. Windows resource
+# limiting would need a Job Object (pywin32), which is out of scope.
+subprocess_preexec_fn = subprocess_rlimits if os.name == "posix" else None
+
+
 def emit_json(data: Any) -> None:
     json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
+
+
+CONFIDENCE_LEVELS = (
+    "confirmed",
+    "probable",
+    "informational",
+    "likely_false_positive",
+)
+
+
+def classify_finding_confidence(finding: str) -> str:
+    """Classify a scanner finding by confidence.
+
+    The four buckets are a heuristic mapping of *how strong* a finding is:
+
+    - confirmed: a recognized provenance structure (C2PA/JUMBF manifest, or a
+      parsed field such as digitalSourceType / trainedAlgorithmicMedia).
+    - probable: an AI/vendor marker found inside a recognized metadata
+      structure, but not a fully parsed provenance claim.
+    - informational: context-only notes (CMS generators, presence of an XMP
+      packet or customXml parts, unsupported/partial inspection).
+    - likely_false_positive: raw whole-file byte scans that can collide with
+      compressed image/stream data.
+
+    The mapping is intentionally conservative; a scanner finding is a signal,
+    not a verdict.
+    """
+    t = finding.lower()
+
+    if any(
+        s in t
+        for s in (
+            "c2patool reports",
+            "c2pa-related manifest",
+            "png chunk c2",
+            "png chunk cabx",
+            "png chunk jumb",
+            "png chunk jumd",
+            "jpeg app11 segment",
+            "digital_source_type",
+            "digitalsourcetype",
+            "trainedalgorithmicmedia",
+            "compositewithtrainedalgorithmicmedia",
+            "softwareagent",
+        )
+    ):
+        return "confirmed"
+
+    if t.startswith("info:") or any(
+        s in t
+        for s in (
+            "cms generator",
+            "customxml parts",
+            "xmp packet present",
+            "unsupported",
+            "not fully inspected",
+            "format not",
+            "svg <metadata> present",
+            "not a valid",
+            "truncated chunk",
+            "bad segment length",
+            "svg decode note",
+        )
+    ):
+        return "informational"
+
+    if "byte-scan" in t:
+        return "likely_false_positive"
+
+    if any(
+        s in t
+        for s in (
+            "ai:",
+            "marker:",
+            "meta:",
+            "frontmatter",
+            "json-ld",
+            "attr:",
+            "png ",
+            "jpeg app",
+            "exif",
+            "xmp",
+            "interesting",
+            "pdf-structured",
+            "layer-a",
+        )
+    ):
+        return "probable"
+
+    return "informational"
 
 
 def cleaned_path(src: Path, suffix: str = ".cleaned") -> Path:
@@ -245,5 +422,7 @@ def safe_arg(path: str) -> str:
     (e.g. exiftool's -@argfile), turning a crafted filename into argv injection.
     """
     if path.startswith("-"):
+        # './' also resolves correctly on Windows (Win32 accepts '/' as a
+        # path separator), so no platform branch is needed here.
         return "./" + path
     return path

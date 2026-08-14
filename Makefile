@@ -1,4 +1,5 @@
-.PHONY: test smoke smoke-synthid bootstrap-synthid docker-synthid-build docker-synthid-help install-skill clean
+.PHONY: test smoke smoke-synthid bootstrap-synthid docker-synthid-build docker-synthid-help \
+	smoke-ctrlregen bootstrap-ctrlregen docker-ctrlregen-build docker-ctrlregen-help install-skill clean
 
 SCRIPTS := skills/remove-ai-marks/scripts
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
@@ -31,6 +32,22 @@ docker-synthid-build:
 
 docker-synthid-help:
 	docker run --rm watermarks-remover-synthid-scorer --help
+
+smoke-ctrlregen:
+	@if [ -z "$(NOAI_WATERMARK_DIR)" ]; then \
+	  echo "smoke-ctrlregen skipped (set NOAI_WATERMARK_DIR)"; \
+	else \
+	  $(PYTHON) $(SCRIPTS)/clean_ctrlregen.py --help >/dev/null && echo "clean_ctrlregen adapter present"; \
+	fi
+
+bootstrap-ctrlregen:
+	./skills/remove-ai-marks/scripts/setup_ctrlregen.sh
+
+docker-ctrlregen-build:
+	docker build -f Dockerfile.ctrlregen -t watermarks-remover-ctrlregen .
+
+docker-ctrlregen-help:
+	docker run --rm watermarks-remover-ctrlregen --help
 
 install-skill:
 	mkdir -p $(HOME)/.grok/skills
