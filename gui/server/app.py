@@ -10,7 +10,6 @@ from __future__ import annotations
 import atexit
 import io
 import json
-import mimetypes
 import os
 import re
 import secrets
@@ -36,6 +35,41 @@ _files: dict[str, dict[str, Any]] = {}
 _files_lock = threading.Lock()
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ \-()\[\]]+")
+
+# Control characters have no business in a header value; a stray CR/LF would
+# let a crafted name inject headers of its own.
+_HEADER_JUNK = re.compile(r"[\x00-\x1f\x7f]")
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+
+def _asset_map() -> dict[str, Path]:
+    """Every shipped file under ``web/``, keyed by its request path.
+
+    Serving from a table built by walking the directory means a request never
+    contributes to a filesystem path: an unknown key is a 404 and nothing else.
+    """
+    root = WEB_DIR.resolve()
+    assets: dict[str, Path] = {}
+    for entry in sorted(root.rglob("*")):
+        if not entry.is_file():
+            continue
+        real = entry.resolve()
+        if real.is_relative_to(root):  # skip a symlink pointing out of web/
+            assets[entry.relative_to(root).as_posix()] = real
+    return assets
+
+
+ASSETS = _asset_map()
 
 
 @atexit.register
@@ -99,18 +133,20 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+        headers = {
+            "Content-Type": ctype,
+            "Content-Length": str(len(body)),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": (
+                "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; "
+                "script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'"
+            ),
+            **(extra or {}),
+        }
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; "
-            "script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'",
-        )
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
+        for k, v in headers.items():
+            self.send_header(k, _HEADER_JUNK.sub("", str(v)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -219,14 +255,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- static -----------------------------------------------------------
     def _static(self, rel: str) -> None:
-        target = (WEB_DIR / rel).resolve()
-        if WEB_DIR.resolve() not in target.parents and target != WEB_DIR.resolve():
+        target = ASSETS.get(unquote(rel))
+        if target is None or not target.is_file():
             return self._fail("Not found", 404)
-        if not target.is_file():
-            return self._fail("Not found", 404)
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("application/javascript",):
-            ctype += "; charset=utf-8"
+        ctype = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
         self._send(200, target.read_bytes(), ctype)
 
     # -- downloads --------------------------------------------------------

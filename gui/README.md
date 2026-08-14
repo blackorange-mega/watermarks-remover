@@ -173,6 +173,8 @@ want SynthID scoring.
 - The server binds to `127.0.0.1` only, on a random port.
 - Every API call needs a session token generated at launch, so other pages open
   in your browser cannot drive it.
+- The only files the server will hand out are the three in `gui/web/`, listed in
+  a table built at startup; a request path is never joined onto a directory.
 - Dragged-in files are copied to a temporary folder that is deleted when the app
   exits. Files opened with **Browse** are read where they are.
 - No telemetry, no network access — except a rewrite backend you configure
