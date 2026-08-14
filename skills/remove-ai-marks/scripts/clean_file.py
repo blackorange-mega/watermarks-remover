@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified clean: text Layer A, PNG/JPEG metadata, and document containers."""
+"""Unified clean: text Layer A, PNG/JPEG/WebP metadata, and document containers."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from container_meta import clean_container, detect_container_format  # noqa: E40
 from image_meta import clean_image, detect_format as detect_image_format  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 CONTAINER_EXTS = {".svg", ".pdf", ".docx", ".odt", ".html", ".htm", ".md", ".markdown", ".mdx"}
 TEXT_EXTS = {
     ".txt",
@@ -50,7 +50,7 @@ def classify(path: Path) -> str:
     if ext in TEXT_EXTS:
         return "text"
     data = path.read_bytes()
-    if detect_image_format(data) in ("png", "jpeg"):
+    if detect_image_format(data) in ("png", "jpeg", "webp"):
         return "image"
     if detect_container_format(path, data) != "unknown":
         return "container"

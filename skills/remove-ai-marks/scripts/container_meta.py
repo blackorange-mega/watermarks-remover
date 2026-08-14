@@ -254,7 +254,7 @@ _GENERATOR_AI_RE = re.compile(
 
 
 def _meta_attrs(tag: str) -> dict[str, str]:
-    return dict(_META_ATTR_RE.findall(tag))
+    return {name.lower(): value for name, value in _META_ATTR_RE.findall(tag)}
 
 
 def _is_cms_generator_meta(tag: str) -> bool:
@@ -694,6 +694,49 @@ def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {"tools": tools}
 
 
+def _pdf_structural_rewrite(dest: Path, actions: list[str]) -> bool:
+    """Rebuild a PDF so unreferenced objects are dropped.
+
+    exiftool's PDF edits are incremental, so freed metadata objects survive in
+    the byte stream. qpdf re-serializes from the object graph, which is what
+    actually removes them. No-op (with a warning) when qpdf is absent.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        actions.append(
+            "warning: exiftool PDF edits are incremental — the original metadata "
+            "bytes remain recoverable; install qpdf for a structural rewrite"
+        )
+        return False
+
+    tmp = dest.with_name(dest.name + ".qpdf-tmp")
+    try:
+        r = subprocess.run(
+            [qpdf, "--linearize", "--", safe_arg(str(dest)), safe_arg(str(tmp))],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+        )
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        actions.append(f"qpdf rewrite failed: {e}; metadata bytes may remain recoverable")
+        return False
+
+    # qpdf exit codes: 0 = clean, 3 = succeeded with warnings (output written).
+    if r.returncode in (0, 3) and tmp.is_file() and tmp.stat().st_size > 0:
+        tmp.replace(dest)
+        actions.append(f"qpdf --linearize structural rewrite (rc={r.returncode})")
+        return True
+
+    tmp.unlink(missing_ok=True)
+    actions.append(
+        f"qpdf rewrite skipped (rc={r.returncode}); metadata bytes may remain recoverable"
+    )
+    return False
+
+
 def clean_pdf(path: Path, dest: Path) -> tuple[list[str], dict]:
     """Best-effort PDF clean. Prefers exiftool; falls back to XMP strip warning."""
     actions: list[str] = []
@@ -720,11 +763,18 @@ def clean_pdf(path: Path, dest: Path) -> tuple[list[str], dict]:
             actions.append(f"exiftool -all= (rc={r.returncode})")
         except Exception as e:
             actions.append(f"exiftool failed: {e}")
+        # exiftool writes PDFs *incrementally*: it appends a
+        # %BeginExifToolUpdate block that frees the Info object and drops
+        # /Info from the trailer, but the original metadata bytes stay in the
+        # file verbatim and are trivially recoverable (exiftool itself can
+        # revert them with -PDF-update:all=). A structural rewrite is what
+        # actually drops the now-unreferenced objects.
+        rewritten = _pdf_structural_rewrite(dest, actions)
         c2patool = which("c2patool")
         # c2patool does not always strip; leave note
         if c2patool:
             actions.append("c2patool available for inspect; strip via exiftool/re-export")
-        return actions, {"mode": "exiftool"}
+        return actions, {"mode": "exiftool", "structural_rewrite": rewritten}
 
     # Degraded: strip obvious XMP packets between <?xpacket begin and end
     text = data

@@ -19,7 +19,7 @@ Agent skill + stdlib Python scripts to strip **multi-vendor AI provenance marks*
 | --- | --- | --- |
 | **A** | Invisible Unicode, exotic spaces, bidi, tag chars | Deterministic Python scripts |
 | **B** | Statistical (token-sampling) text watermarks | Agent rewrite + optional `rewrite_text.py` hook |
-| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, SVG, PDF, DOCX, ODT, HTML, Markdown |
+| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, WebP, SVG, PDF, DOCX, ODT, HTML, Markdown |
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style marks.
 
@@ -61,6 +61,7 @@ Optional system tools (auto-used when present):
 | --- | --- |
 | [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests |
 | [`exiftool`](https://exiftool.org/) | Residual metadata strip (esp. **PDF**) |
+| [`qpdf`](https://qpdf.sourceforge.io/) | Structural PDF rebuild — **required** for a real PDF strip (see below) |
 
 Core scripts need **Python 3.10+** stdlib only. Layer B model calls are optional.
 
@@ -140,6 +141,10 @@ REVERSE_SYNTHID_DIR=~/reverse-SynthID \
 full upstream `requirements.txt`, which adds `torch`/`diffusers` for the
 upstream VAE bypass this project does not use).
 
+On Windows use `setup_synthid.ps1` (`-Dir`, `-Ref`, `-Full`), which creates the
+venv at `.venv\Scripts\` — the layout `image_meta.py` already looks for on
+`os.name == "nt"`.
+
 ### Option 2: local Docker build
 
 ```bash
@@ -184,6 +189,15 @@ SCRIPTS=skills/remove-ai-marks/scripts
 NOAI_WATERMARK_DIR=~/noai-watermark \
 ~/noai-watermark/.venv/bin/python "$SCRIPTS/clean_ctrlregen.py" shot.png -o shot.ctrlregen.png
 ```
+
+On Windows use `setup_ctrlregen.ps1` (same flags as `-Dir`, `-Ref`, `-Python`);
+the venv lands in `.venv\Scripts\`, which `clean_image.py` already resolves.
+It picks the torch wheel index from the GPU's **compute capability** rather
+than the CUDA version `nvidia-smi` prints — that number is the maximum the
+*driver* supports, and drivers are backward compatible, so deriving the wheel
+tag from it installs `cu130` on a Pascal card whose kernels were dropped in
+`cu128`. The script forces `cu126` below compute capability 7.5 and then
+verifies the result with `torch.cuda.get_arch_list()`.
 
 ### From `clean_image.py`
 
@@ -293,13 +307,31 @@ Layer B makes sense when you specifically want the premium model's **thinking an
 
 | Format | Inspect | Clean |
 | --- | --- | --- |
-| PNG / JPEG | C2PA chunks / APP11, AI XMP hints | Drop metadata segments |
+| PNG / JPEG / WebP | C2PA chunks / APP11 / RIFF `C2PA`, AI XMP hints | Drop metadata segments |
 | SVG | `<metadata>`, XMP | Strip blocks |
-| PDF | Byte/XMP + optional tools | **exiftool** preferred; degraded without it |
+| PDF | Byte/XMP + optional tools | **exiftool** then **qpdf**; degraded without either |
 | DOCX | docProps / customXml | Scrub props, drop customXml |
 | ODT | meta.xml | Drop generator / AI-ish meta |
 | HTML | meta, JSON-LD, data-ai* | Strip tags/attrs |
 | Markdown | YAML frontmatter AI keys | Drop keys + Layer A body |
+
+#### Why PDF needs qpdf, not just exiftool
+
+ExifTool writes PDFs **incrementally**. `exiftool -all=` appends a
+`%BeginExifToolUpdate` block that frees the Info object and drops `/Info` from
+the trailer — but the original metadata bytes stay in the file verbatim, and
+exiftool itself can undo the edit with `-PDF-update:all=`. The command exits
+`0`, viewers show no metadata, and the file gets *larger*, which is the tell.
+
+For a provenance-stripping tool that is a silent leak, so `clean_pdf` follows
+the exiftool pass with `qpdf --linearize`, which re-serializes the document
+from its object graph and drops the now-unreferenced objects. Without `qpdf`
+installed the clean still runs, but it says so:
+
+```
+warning: exiftool PDF edits are incremental — the original metadata bytes
+remain recoverable; install qpdf for a structural rewrite
+```
 
 Pixel-domain watermark **removal** is now available as an optional external CtrlRegen backend (see above); it is a regenerating remover, not a guarantee. **C2PA soft binding** (in-content watermark that can re-link a remote Content Credentials manifest after metadata is stripped) remains **out of scope**. Stripping hard-bound C2PA does **not** clear those channels.
 
@@ -346,6 +378,10 @@ make smoke                          # quick CLI smoke on fixtures
 ```
 
 ## Changelog
+
+### Unreleased
+
+- Add stdlib-only WebP inspection and metadata cleaning for RIFF `C2PA`, XMP, EXIF, and ICC profile chunks
 
 ### [v0.4.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.4.0) — pixel removal, finding confidence, Windows & false-positive fixes
 
@@ -445,6 +481,7 @@ MIT — see [LICENSE](LICENSE).
 - Google AI for Developers, [*SynthID safeguards*](https://ai.google.dev/responsible/docs/safeguards/synthid) (Gemini API docs)
 - [C2PA](https://c2pa.org/) / [c2patool](https://github.com/contentauth/c2pa-rs/tree/main/cli)
 - Kirchenbauer et al., [*A Watermark for Large Language Models*](https://arxiv.org/abs/2301.10226)
+- [THU-BPM/MarkLLM](https://github.com/THU-BPM/MarkLLM) (unified toolkit for evaluating LLM watermarking algorithms)
 - Zhang et al., [*Watermarks in the Sand: Impossibility of Strong Watermarking for Generative Models*](https://arxiv.org/abs/2311.04378) (ICML 2024)
 - [google-deepmind/synthid-text](https://github.com/google-deepmind/synthid-text) (research reference; not used for detection here)
 - [aloshdenny/reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) (research reference)

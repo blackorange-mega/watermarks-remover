@@ -9,11 +9,9 @@ GitHub Release (when releases exist). Older tags are not maintained.
 
 **Do not open a public issue for security problems.**
 
-Please report vulnerabilities privately using one of:
-
-1. **[GitHub Security Advisories](https://github.com/guillaumemeyer/watermarks-remover/security/advisories/new)**
-   (preferred) — "Report a vulnerability" on the repository Security tab
-2. A private message to the repository maintainers via GitHub
+Please report vulnerabilities privately via
+**[GitHub Security Advisories](https://github.com/guillaumemeyer/watermarks-remover/security/advisories/new)**
+— use the "Report a vulnerability" button on the repository Security tab.
 
 Include:
 

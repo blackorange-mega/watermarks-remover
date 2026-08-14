@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified inspect: text, images (PNG/JPEG), and containers (SVG/PDF/DOCX/ODT/HTML/MD)."""
+"""Unified inspect: text, images (PNG/JPEG/WebP), and document containers."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from image_meta import inspect_image  # noqa: E402
 from text_unicode import human_report, inspect_text  # noqa: E402
 
 TEXT_EXTS = {".txt", ".text", ".md", ".markdown", ".mdx", ".html", ".htm", ".css", ".js", ".py", ".rs", ".go", ".json", ".yaml", ".yml", ".toml", ".csv"}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 CONTAINER_EXTS = {".svg", ".pdf", ".docx", ".odt", ".html", ".htm", ".md", ".markdown", ".mdx"}
 
 
@@ -37,7 +37,11 @@ def classify(path: Path) -> str:
         return "text"
     # magic sniff
     data = path.read_bytes()[:16]
-    if detect_image_format(data if len(data) >= 8 else path.read_bytes()) in ("png", "jpeg"):
+    if detect_image_format(data if len(data) >= 12 else path.read_bytes()) in (
+        "png",
+        "jpeg",
+        "webp",
+    ):
         return "image"
     fmt = detect_container_format(path, path.read_bytes()[:4096] if path.stat().st_size else b"")
     if fmt != "unknown":
@@ -72,6 +76,7 @@ def main() -> int:
         return 2
 
     kind = args.force_type if args.force_type != "auto" else classify(args.path)
+    file_label = str(args.path.resolve())
 
     if kind == "text":
         text = read_text_input(
@@ -81,18 +86,20 @@ def main() -> int:
         )
         report = inspect_text(text, aggressive=args.aggressive)
         if args.json:
-            emit_json({"kind": "text", **report.to_dict()})
+            emit_json({"kind": "text", "path": file_label, **report.to_dict()})
         else:
-            print(f"Kind: text")
+            print(f"File: {file_label}")
+            print("Kind: text")
             print(human_report(report))
         return 0 if report.suspicious_total == 0 else 1
 
     if kind == "image":
         report = inspect_image(args.path)
         if args.json:
-            emit_json({"kind": "image", **report.to_dict()})
+            emit_json({"kind": "image", "path": file_label, **report.to_dict()})
         else:
-            print(f"Kind: image")
+            print(f"File: {file_label}")
+            print("Kind: image")
             print(f"Path: {report.path}")
             print(f"Format: {report.format}")
             print(f"C2PA: {report.has_c2pa}")
@@ -103,9 +110,10 @@ def main() -> int:
 
     report = inspect_container(args.path)
     if args.json:
-        emit_json({"kind": "container", **report.to_dict()})
+        emit_json({"kind": "container", "path": file_label, **report.to_dict()})
     else:
-        print(f"Kind: container")
+        print(f"File: {file_label}")
+        print("Kind: container")
         print(f"Path: {report.path}")
         print(f"Format: {report.format}")
         print(f"C2PA: {report.has_c2pa}")

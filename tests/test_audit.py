@@ -8,10 +8,13 @@ import sys
 import zlib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import audit_website  # noqa: E402
 from audit_lib import aggregate, is_actionable, scan_file  # noqa: E402
 from audit_website import guess_kind, inspect_remote, parse_sitemap  # noqa: E402
 from common import classify_finding_confidence  # noqa: E402
@@ -167,3 +170,239 @@ def test_inspect_remote_html_cms_informational():
     assert result["kind"] == "html"
     assert result["confidence"] == ["informational"]
     assert not is_actionable(result)
+
+
+
+def test_parse_sitemap_rejects_oversized_gzip(monkeypatch):
+    monkeypatch.setattr(
+        audit_website,
+        "MAX_SITEMAP_DECOMPRESSED_BYTES",
+        128,
+    )
+
+    payload = b"<urlset>" + (b" " * 256) + b"</urlset>"
+
+    with pytest.raises(
+        ValueError,
+        match="decompressed size exceeds cap",
+    ):
+        audit_website.parse_sitemap(gzip.compress(payload))
+
+
+def test_validate_public_url_rejects_private_literal():
+    with pytest.raises(ValueError, match="non-public address"):
+        audit_website._validate_public_http_url(
+            "http://127.0.0.1/secret"
+        )
+
+
+def test_validate_public_url_rejects_private_dns(monkeypatch):
+    def fake_getaddrinfo(host, port, *, type):
+        return [
+            (
+                audit_website.socket.AF_INET,
+                audit_website.socket.SOCK_STREAM,
+                6,
+                "",
+                ("10.0.0.8", port),
+            )
+        ]
+
+    monkeypatch.setattr(
+        audit_website.socket,
+        "getaddrinfo",
+        fake_getaddrinfo,
+    )
+
+    with pytest.raises(ValueError, match="non-public address"):
+        audit_website._validate_public_http_url(
+            "https://example.com/page"
+        )
+
+
+def test_validate_public_url_accepts_public_dns(monkeypatch):
+    def fake_getaddrinfo(host, port, *, type):
+        return [
+            (
+                audit_website.socket.AF_INET,
+                audit_website.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", port),
+            )
+        ]
+
+    monkeypatch.setattr(
+        audit_website.socket,
+        "getaddrinfo",
+        fake_getaddrinfo,
+    )
+
+    assert audit_website._validate_public_http_url(
+        "https://example.com/page"
+    ) == (
+        "https",
+        "example.com",
+        443,
+    )
+
+
+def test_collect_urls_rejects_cross_origin_entry(monkeypatch):
+    def fake_getaddrinfo(host, port, *, type):
+        return [
+            (
+                audit_website.socket.AF_INET,
+                audit_website.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", port),
+            )
+        ]
+
+    def fake_fetch(
+        url,
+        timeout,
+        max_bytes,
+        *,
+        allowed_origin=None,
+    ):
+        return (
+            b"<urlset><url>"
+            b"<loc>http://127.0.0.1/secret</loc>"
+            b"</url></urlset>",
+            "application/xml",
+        )
+
+    monkeypatch.setattr(
+        audit_website.socket,
+        "getaddrinfo",
+        fake_getaddrinfo,
+    )
+    monkeypatch.setattr(
+        audit_website,
+        "fetch",
+        fake_fetch,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cross-origin sitemap URL",
+    ):
+        audit_website.collect_urls(
+            "https://example.com/sitemap.xml",
+            1,
+            10,
+        )
+
+
+def test_pinned_connection_uses_validated_numeric_ip(monkeypatch):
+    seen = []
+
+    class FakeSocket:
+        def close(self):
+            pass
+
+    def fake_create_connection(address, timeout=None):
+        seen.append(address)
+        return FakeSocket()
+
+    monkeypatch.setattr(
+        audit_website.socket,
+        "create_connection",
+        fake_create_connection,
+    )
+
+    conn = audit_website._open_pinned_connection(
+        ("http", "example.com", 80),
+        ("93.184.216.34",),
+        1,
+    )
+
+    try:
+        assert seen == [("93.184.216.34", 80)]
+        assert conn.host == "example.com"
+    finally:
+        conn.close()
+
+
+def test_fetch_revalidates_redirect_before_second_connection(monkeypatch):
+    dns_calls = 0
+    connections = 0
+
+    def fake_getaddrinfo(host, port, *, type):
+        nonlocal dns_calls
+        dns_calls += 1
+        address = "93.184.216.34" if dns_calls == 1 else "10.0.0.9"
+        return [
+            (
+                audit_website.socket.AF_INET,
+                audit_website.socket.SOCK_STREAM,
+                6,
+                "",
+                (address, port),
+            )
+        ]
+
+    class RedirectResponse:
+        status = 302
+
+        def getheader(self, name, default=None):
+            if name == "Location":
+                return "https://example.com/private"
+            return default
+
+        def close(self):
+            pass
+
+    class RedirectConnection:
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return RedirectResponse()
+
+        def close(self):
+            pass
+
+    def fake_open(origin, addresses, timeout):
+        nonlocal connections
+        connections += 1
+        return RedirectConnection()
+
+    monkeypatch.setattr(
+        audit_website.socket,
+        "getaddrinfo",
+        fake_getaddrinfo,
+    )
+    monkeypatch.setattr(
+        audit_website,
+        "_open_pinned_connection",
+        fake_open,
+    )
+
+    with pytest.raises(ValueError, match="non-public address"):
+        audit_website.fetch(
+            "https://example.com/start",
+            1,
+            1024,
+        )
+
+    assert connections == 1
+
+
+def test_main_rejects_private_base_cleanly(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_website.py",
+            "--base",
+            "http://127.0.0.1",
+        ],
+    )
+
+    assert audit_website.main() == 2
+
+    err = capsys.readouterr().err
+    assert "invalid base URL" in err
+    assert "non-public address" in err

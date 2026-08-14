@@ -26,7 +26,7 @@ def main() -> int:
     p.add_argument(
         "--strip-emoji-glue",
         action="store_true",
-        help="Paranoid: flag all load-bearing invisibles too (emoji glue, script joiners, flag tags, orthographic Cf)",
+        help="Paranoid: flag all load-bearing invisibles too (emoji glue, script joiners, flag tags, same-script fillers/selectors, orthographic Cf)",
     )
     p.add_argument(
         "--force-text",

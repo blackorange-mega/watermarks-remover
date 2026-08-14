@@ -3,7 +3,7 @@ name: remove-ai-marks
 description: >
   Remove multi-vendor AI provenance marks: invisible Unicode (Layer A), statistical
   text watermarks via rewrite (Layer B, always offer), and C2PA/EXIF/XMP/container
-  metadata on PNG/JPEG/SVG/PDF/DOCX/ODT/HTML/MD. Covers Claude, Gemini/SynthID-class,
+  metadata on PNG/JPEG/WebP/SVG/PDF/DOCX/ODT/HTML/MD. Covers Claude, Gemini/SynthID-class,
   OpenAI provenance, and open-LLM sampling marks. Use when the user asks to strip
   watermarks, remove C2PA/Content Credentials, clean AI metadata, remove invisible
   Unicode, anti-detect clean AI output, or runs /remove-ai-marks (aliases:
@@ -33,7 +33,7 @@ python3 "$SCRIPTS/clean_text.py" ...
 python3 "$SCRIPTS/inspect_image.py" ...
 python3 "$SCRIPTS/clean_image.py" ...
 python3 "$SCRIPTS/clean_ctrlregen.py" ...   # optional external pixel removal (bootstrap first)
-"$SCRIPTS/setup_ctrlregen.sh"              # one-command bootstrap for the above
+"$SCRIPTS/setup_ctrlregen.sh"              # one-command bootstrap (Windows: setup_ctrlregen.ps1)
 python3 "$SCRIPTS/rewrite_text.py" ...
 python3 "$SCRIPTS/audit_dir.py" ...
 python3 "$SCRIPTS/audit_website.py" ...
@@ -52,7 +52,7 @@ Intended for **your own** content (privacy, hygiene, research). Do not market re
 | Pasted / clipboard text | temp file or stdin → text pipeline |
 | `.txt` / code | text Layer A (+ formatter for code) |
 | `.md` / `.html` | container clean (frontmatter/meta) + Layer A |
-| `.png` / `.jpg` / `.jpeg` | image metadata strip |
+| `.png` / `.jpg` / `.jpeg` / `.webp` | image metadata strip |
 | `.svg` / `.pdf` / `.docx` / `.odt` | container metadata strip |
 | Directory | aggregate report with `audit_dir.py` |
 | Website / sitemap | aggregate report with `audit_website.py` |
@@ -117,7 +117,7 @@ python3 "$SCRIPTS/clean_file.py" INPUT -o OUTPUT
 python3 "$SCRIPTS/inspect_file.py" OUTPUT   # verify
 ```
 
-Optional tools if installed: `c2patool`, `exiftool` (auto-used when present; PDF strongly prefers exiftool).
+Optional tools if installed: `c2patool`, `exiftool`, `qpdf` (auto-used when present). PDF needs **both** exiftool and qpdf: exiftool's PDF edits are incremental, so without the qpdf rebuild the original metadata bytes stay recoverable in the file. `clean_file.py` warns when qpdf is missing.
 
 **Images — optional pixel removal (external):** after the metadata clean, add
 `--remove-pixel ctrlregen` to `clean_image.py` (bootstrap the backend first).
@@ -236,7 +236,7 @@ Always state:
 
 - Layer A does **not** remove token-sampling watermarks.
 - Layer B cannot be gold-verified without vendor detectors / keys.
-- PDF strip is best-effort without `exiftool`.
+- PDF strip is best-effort without `exiftool`, and incomplete without `qpdf`: exiftool alone leaves the freed metadata objects in the byte stream.
 - Pixel-domain **image** watermarks can be removed optionally via the external CtrlRegen backend (`clean_image.py --remove-pixel ctrlregen`); audio/video watermarks remain out of scope for removal.
 - The CtrlRegen backend is external, all-rights-reserved (no LICENSE file), never bundled, heavy (~10 GB model downloads), and a regenerating remover — no local detector certifies StegaStamp/Tree-Ring/StableSignature removal.
 - The reverse-SynthID scorer is external, best-effort, and under a non-commercial Research License; it is not bundled and is not an official Google detector.

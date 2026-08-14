@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect PNG/JPEG for C2PA and AI-related metadata."""
+"""Inspect PNG/JPEG/WebP for C2PA and AI-related metadata."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from image_meta import inspect_image  # noqa: E402
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("path", type=Path, help="Image path (PNG or JPEG)")
+    p.add_argument("path", type=Path, help="Image path (PNG, JPEG, or WebP)")
     p.add_argument("--json", action="store_true")
     p.add_argument(
         "--synthid-dir",

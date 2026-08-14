@@ -150,3 +150,67 @@ def test_strip_emoji_glue_flag_restores_blanket_strip():
     cleaned, _ = clean_text("\u0645\u06cc\u200c\u0631", strip_emoji_glue=True)
     assert "\u200c" not in cleaned
     assert clean_text("x\u0600y", strip_emoji_glue=True)[0] == "xy"
+
+
+def test_clean_preserves_mongolian_fvs():
+    # Mongolian letter + FVS1/2/3 selects a positional glyph variant.
+    for raw in ("\u1820\u180b\u1821", "\u1820\u180c\u1821", "\u1820\u180d\u1821"):
+        cleaned, _ = clean_text(raw)
+        assert cleaned == raw
+    # FVS can chain after a single letter; both must stay bound to the base.
+    raw = "\u1820\u180b\u180c\u1821"
+    cleaned, _ = clean_text(raw)
+    assert cleaned == raw
+
+
+def test_clean_preserves_khmer_inherent_vowels():
+    # Invisible but phonemic inherent vowels after a Khmer consonant.
+    for raw in ("\u1780\u17b4\u1781", "\u1780\u17b5\u1781"):
+        cleaned, _ = clean_text(raw)
+        assert cleaned == raw
+
+
+def test_clean_preserves_hangul_fillers():
+    # Fillers hold jamo slots in a partial syllable; removing them lets the
+    # jamo compose into a different syllable (ᄀᅟᅡ vs 가).
+    for raw in ("\u1100\u115f\u1161", "\u1100\u1160\u1161"):
+        cleaned, _ = clean_text(raw)
+        assert cleaned == raw
+
+
+def test_clean_still_strips_floating_script_glue():
+    # Isolated between Latin these are contraband, not orthography.
+    for raw in ("a\u180bb", "a\u17b4b", "a\u115fb", "\u180b", "\u1160"):
+        cleaned, _ = clean_text(raw)
+        assert cleaned == raw.replace("\u180b", "").replace("\u17b4", "").replace("\u115f", "").replace("\u1160", "")
+
+
+def test_clean_strip_emoji_glue_flag_strips_script_glue():
+    for raw in ("\u1820\u180b\u1821", "\u1780\u17b4\u1781", "\u1100\u115f\u1161"):
+        cleaned, _ = clean_text(raw, strip_emoji_glue=True)
+        assert "\u180b" not in cleaned and "\u17b4" not in cleaned and "\u115f" not in cleaned
+
+
+def test_clean_strips_private_use():
+    # BMP + both supplementary PUA planes: no portable meaning, so stripped.
+    raw = "a\ue000b\U000f0000c\U0010fffd"
+    cleaned, stats = clean_text(raw)
+    assert cleaned == "abc"
+    assert stats["removed_count"] >= 3
+
+
+def test_inspect_script_glue_not_suspicious_by_default():
+    raw = "\u1820\u180b\u1821\u1780\u17b4\u1781\u1100\u115f\u1161"
+    report = inspect_text(raw)
+    assert report.suspicious_total == 0
+
+
+def test_inspect_floating_script_glue_is_suspicious():
+    for raw in ("a\u180b", "a\u17b4", "a\u115f"):
+        report = inspect_text(raw)
+        assert report.suspicious_total >= 1
+
+
+def test_inspect_private_use():
+    report = inspect_text("a\ue000b")
+    assert any(h.kind == "private_use" for h in report.hits)
