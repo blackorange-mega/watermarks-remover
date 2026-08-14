@@ -398,6 +398,100 @@ def _ctrlregen_python(upstream: Path) -> str:
     return sys.executable
 
 
+def _markdiffusion_python(upstream: Path | None) -> str:
+    """Prefer the bootstrap venv so torch/diffusers/markdiffusion importable."""
+    if upstream is not None:
+        if os.name == "nt":
+            venv = upstream / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv = upstream / ".venv" / "bin" / "python"
+        if venv.is_file():
+            return str(venv)
+    return sys.executable
+
+
+def run_markdiffusion_purify(
+    path: Path,
+    output: Path,
+    *,
+    upstream_dir: str | None = None,
+    strength: float = 0.3,
+    model: str | None = None,
+    size: int = 512,
+    steps: int = 50,
+    device: str | None = None,
+    timeout: int = 3600,
+) -> dict[str, Any]:
+    """Run the optional MarkDiffusion DiffusionPurification remover in a subprocess.
+
+    Returns ``{"available": False, "error": ...}`` when the backend is not
+    configured, its dependencies are missing, or it fails at runtime; a
+    successful run is ``{"available": True, ...}``.
+    """
+    if upstream_dir is None:
+        upstream_dir = os.environ.get("MARKDIFFUSION_DIR")
+
+    upstream = (
+        Path(upstream_dir).expanduser().resolve() if upstream_dir else None
+    )
+    if upstream is not None and not upstream.is_dir():
+        return {
+            "available": False,
+            "error": f"MarkDiffusion dir not found: {upstream}",
+        }
+
+    script = SCRIPTS_DIR / "markdiffusion_harness.py"
+    cmd = [
+        _markdiffusion_python(upstream),
+        str(script),
+        "purify",
+        str(path),
+        "-o",
+        str(output),
+        "--purification-strength",
+        str(strength),
+        "--size",
+        str(size),
+        "--steps",
+        str(steps),
+        "--json",
+    ]
+    if upstream is not None:
+        cmd += ["--upstream-dir", str(upstream)]
+    if model:
+        cmd += ["--model", str(model)]
+    if device:
+        cmd += ["--device", str(device)]
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            preexec_fn=ctrlregen_subprocess_preexec_fn,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "error": f"DiffusionPurification timed out after {timeout}s",
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+    if r.returncode != 0:
+        return {"available": False, "error": (r.stderr or "").strip()[:2000]}
+    try:
+        payload = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError as e:
+        return {
+            "available": False,
+            "error": f"bad MarkDiffusion adapter JSON: {e}",
+        }
+    payload["available"] = True
+    return payload
+
+
 def run_ctrlregen_clean(
     path: Path,
     output: Path,
@@ -700,6 +794,13 @@ def clean_image(
     ctrlregen_device: str | None = None,
     ctrlregen_seed: int | None = None,
     ctrlregen_timeout: int = 3600,
+    markdiffusion_dir: str | None = None,
+    markdiffusion_strength: float = 0.3,
+    markdiffusion_model: str | None = None,
+    markdiffusion_size: int = 512,
+    markdiffusion_steps: int = 50,
+    markdiffusion_device: str | None = None,
+    markdiffusion_timeout: int = 3600,
 ) -> dict[str, Any]:
     synthid_before = run_synthid_score(path, synthid_dir)
     data = path.read_bytes()
@@ -737,25 +838,48 @@ def clean_image(
 
     pixel_removal: dict[str, Any] | None = None
     if remove_pixel:
-        if remove_pixel != "ctrlregen":
-            raise ValueError(f"unknown pixel remover: {remove_pixel}")
-        pixel_removal = run_ctrlregen_clean(
-            dest,
-            dest,
-            upstream_dir=ctrlregen_dir,
-            strength=ctrlregen_strength,
-            steps=ctrlregen_steps,
-            device=ctrlregen_device,
-            seed=ctrlregen_seed,
-            timeout=ctrlregen_timeout,
-        )
-        if pixel_removal.get("available"):
-            actions.append(f"CtrlRegen pixel removal (strength {ctrlregen_strength})")
-        else:
-            actions.append(
-                "CtrlRegen pixel removal skipped: "
-                f"{pixel_removal.get('error', 'unknown error')}"
+        if remove_pixel == "ctrlregen":
+            pixel_removal = run_ctrlregen_clean(
+                dest,
+                dest,
+                upstream_dir=ctrlregen_dir,
+                strength=ctrlregen_strength,
+                steps=ctrlregen_steps,
+                device=ctrlregen_device,
+                seed=ctrlregen_seed,
+                timeout=ctrlregen_timeout,
             )
+            if pixel_removal.get("available"):
+                actions.append(f"CtrlRegen pixel removal (strength {ctrlregen_strength})")
+            else:
+                actions.append(
+                    "CtrlRegen pixel removal skipped: "
+                    f"{pixel_removal.get('error', 'unknown error')}"
+                )
+        elif remove_pixel == "diffusion":
+            pixel_removal = run_markdiffusion_purify(
+                dest,
+                dest,
+                upstream_dir=markdiffusion_dir,
+                strength=markdiffusion_strength,
+                model=markdiffusion_model,
+                size=markdiffusion_size,
+                steps=markdiffusion_steps,
+                device=markdiffusion_device,
+                timeout=markdiffusion_timeout,
+            )
+            if pixel_removal.get("available"):
+                actions.append(
+                    f"DiffusionPurification pixel removal "
+                    f"(strength {markdiffusion_strength})"
+                )
+            else:
+                actions.append(
+                    "DiffusionPurification pixel removal skipped: "
+                    f"{pixel_removal.get('error', 'unknown error')}"
+                )
+        else:
+            raise ValueError(f"unknown pixel remover: {remove_pixel}")
 
     after = inspect_image(dest, synthid_dir=synthid_dir)
     return {

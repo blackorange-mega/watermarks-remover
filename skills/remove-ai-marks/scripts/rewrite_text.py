@@ -26,9 +26,11 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -36,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import cleaned_path, eprint, read_text_input, write_text_output  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
+
+DEFAULT_MARKLLM_MODEL = "facebook/opt-1.3b"
 
 PROMPTS = {
     "paraphrase": (
@@ -169,6 +173,101 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+
+
+def _venv_python(upstream: Path) -> Path | None:
+    """Locate the MarkLLM checkout's venv interpreter, if it exists."""
+    if os.name == "nt":
+        candidate = upstream / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = upstream / ".venv" / "bin" / "python"
+    return candidate if candidate.is_file() else None
+
+
+def _markllm_preexec() -> Callable[[], None] | None:
+    """Optional RLIMIT_AS guard for the MarkLLM child; None means "no limit".
+
+    torch/CUDA usually needs large address spaces, so unlike the
+    exiftool/c2patool/SynthID children (common.subprocess_rlimits) this is
+    opt-in via WATERMARKS_MARKLLM_RLIMIT_AS (byte count, hex/octal allowed).
+    POSIX only; on Windows preexec_fn must stay None.
+    """
+    raw = os.environ.get("WATERMARKS_MARKLLM_RLIMIT_AS")
+    if not raw or os.name != "posix":
+        return None
+    try:
+        limit = int(raw, 0)
+    except ValueError:
+        return None
+
+    def _apply() -> None:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    return _apply
+
+
+def _markllm_detect(
+    text: str,
+    *,
+    scheme: str,
+    upstream_dir: str,
+    model: str,
+    timeout: float,
+) -> dict:
+    """Run the MarkLLM adapter on *text*; never fails the rewrite.
+
+    Returns the adapter's JSON payload, or an ``available: False`` dict with
+    an ``error`` string when the backend is unconfigured or broken. The Layer B
+    rewrite proceeds regardless; MarkLLM verification is best-effort.
+    """
+    if not upstream_dir:
+        return {"available": False, "error": "no MARKLLM_DIR set"}
+    upstream = Path(upstream_dir).expanduser().resolve()
+    if not upstream.is_dir() or not (upstream / "watermark").is_dir():
+        return {"available": False, "error": f"MarkLLM checkout missing: {upstream}"}
+    venv_python = _venv_python(upstream)
+    if venv_python is None:
+        return {"available": False, "error": f"MarkLLM venv missing: {upstream}"}
+
+    cmd = [
+        str(venv_python),
+        str(SCRIPTS_DIR / "detect_text_watermark.py"),
+        "detect",
+        "-",
+        "--scheme",
+        scheme,
+        "--upstream-dir",
+        str(upstream),
+        "--model",
+        model,
+        "--json",
+    ]
+    try:
+        r = subprocess.run(
+            cmd,
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            preexec_fn=_markllm_preexec(),
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError) as e:
+        return {"available": False, "error": f"MarkLLM adapter error: {e}"}
+
+    if r.returncode != 0:
+        return {
+            "available": False,
+            "error": (r.stderr or "").strip() or f"adapter exited {r.returncode}",
+        }
+    try:
+        return json.loads(r.stdout)
+    except ValueError as e:
+        return {"available": False, "error": f"adapter JSON parse error: {e}"}
+
+
 def build_prompt(strength: str, text: str, *, lang: str, original_lang: str) -> str:
     if strength == "paraphrase":
         return PROMPTS["paraphrase"].format(TEXT=text)
@@ -276,6 +375,10 @@ def rewrite(
     temperature: float,
     candidates: int,
     allow_remote: bool = False,
+    markllm_scheme: str | None = None,
+    markllm_dir: str | None = None,
+    markllm_model: str | None = None,
+    markllm_timeout: float = 180.0,
 ) -> tuple[str, dict]:
     prompt = build_prompt(strength, text, lang=lang, original_lang=original_lang)
     info: dict = {
@@ -287,6 +390,22 @@ def rewrite(
         "prompt_chars": len(prompt),
         "input_chars": len(text),
     }
+
+    markllm: dict | None = None
+    if markllm_scheme:
+        markllm = {
+            "scheme": markllm_scheme,
+            "before": _markllm_detect(
+                text,
+                scheme=markllm_scheme,
+                upstream_dir=markllm_dir or "",
+                model=markllm_model or DEFAULT_MARKLLM_MODEL,
+                timeout=markllm_timeout,
+            ),
+        }
+        if not markllm["before"]["available"]:
+            eprint(f"markllm verification unavailable: {markllm['before']['error']}")
+        info["markllm"] = markllm
 
     if backend == "print-prompt":
         info["mode"] = "print-prompt"
@@ -330,6 +449,26 @@ def rewrite(
         "Layer B is best-effort against statistical token-sampling watermarks; "
         "cannot certify removal against a vendor detector."
     )
+
+    if markllm:
+        after = _markllm_detect(
+            out,
+            scheme=markllm["scheme"],
+            upstream_dir=markllm_dir or "",
+            model=markllm_model or DEFAULT_MARKLLM_MODEL,
+            timeout=markllm_timeout,
+        )
+        markllm["after"] = after
+        before = markllm["before"]
+        if before.get("available") and after.get("available"):
+            markllm["cleared"] = bool(
+                before.get("is_watermarked") and not after.get("is_watermarked")
+            )
+        markllm["note"] = (
+            "MarkLLM detection is only valid against the SAME scheme config + "
+            "keys used at generation; it does not certify a vendor detector."
+        )
+
     return out, info
 
 
@@ -383,6 +522,29 @@ def main() -> int:
     )
     p.add_argument("--json-stats", action="store_true", help="Stats JSON on stderr")
     p.add_argument(
+        "--markllm-scheme",
+        choices=("kgw", "synthid", "synthid-text"),
+        default=None,
+        help="Optional: run MarkLLM before/after detection around the rewrite "
+        "(scheme = kgw or synthid)",
+    )
+    p.add_argument(
+        "--markllm-dir",
+        default=_env("MARKLLM_DIR"),
+        help="MarkLLM checkout root (default: $MARKLLM_DIR)",
+    )
+    p.add_argument(
+        "--markllm-model",
+        default=_env("MARKLLM_MODEL", DEFAULT_MARKLLM_MODEL),
+        help=f"Scoring model for MarkLLM detection (default: $MARKLLM_MODEL or {DEFAULT_MARKLLM_MODEL})",
+    )
+    p.add_argument(
+        "--markllm-timeout",
+        type=float,
+        default=float(_env("WATERMARKS_MARKLLM_TIMEOUT", "180.0")),
+        help="Timeout per MarkLLM detection call (default: 180.0)",
+    )
+    p.add_argument(
         "--force-text",
         action="store_true",
         help="Rewrite even when the input looks like a binary container",
@@ -410,6 +572,10 @@ def main() -> int:
             temperature=args.temperature,
             candidates=args.candidates,
             allow_remote=allow_remote,
+            markllm_scheme=args.markllm_scheme,
+            markllm_dir=args.markllm_dir,
+            markllm_model=args.markllm_model,
+            markllm_timeout=args.markllm_timeout,
         )
     except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
         eprint(f"rewrite failed: {e}")

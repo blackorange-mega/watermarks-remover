@@ -11,8 +11,8 @@ from typing import Any
 
 from common import CONFIDENCE_LEVELS, classify_finding_confidence
 from container_meta import inspect_container
+from format_dispatch import classify
 from image_meta import inspect_image
-from inspect_file import classify
 from text_unicode import inspect_text
 
 

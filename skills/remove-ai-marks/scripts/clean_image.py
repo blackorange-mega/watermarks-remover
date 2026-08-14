@@ -37,9 +37,11 @@ def main() -> int:
     )
     p.add_argument(
         "--remove-pixel",
-        choices=["ctrlregen"],
+        choices=["ctrlregen", "diffusion"],
         default=None,
-        help="Run optional CtrlRegen pixel-watermark removal after metadata cleaning",
+        help="Run optional pixel-watermark removal after metadata cleaning "
+        "(ctrlregen = CtrlRegen regeneration; diffusion = MarkDiffusion "
+        "DiffusionPurification regeneration)",
     )
     p.add_argument(
         "--ctrlregen-dir",
@@ -77,6 +79,48 @@ def main() -> int:
         default=3600,
         help="CtrlRegen subprocess timeout in seconds (default: 3600)",
     )
+    p.add_argument(
+        "--markdiffusion-dir",
+        type=str,
+        default=None,
+        help="MarkDiffusion bootstrap dir (default: $MARKDIFFUSION_DIR)",
+    )
+    p.add_argument(
+        "--markdiffusion-strength",
+        type=float,
+        default=0.3,
+        help="DiffusionPurification strength in (0, 1] (default: 0.3)",
+    )
+    p.add_argument(
+        "--markdiffusion-model",
+        type=str,
+        default=None,
+        help="Stable Diffusion model for purification (default: SD 2.1 base)",
+    )
+    p.add_argument(
+        "--markdiffusion-size",
+        type=int,
+        default=512,
+        help="Purification working size in px (default: 512)",
+    )
+    p.add_argument(
+        "--markdiffusion-steps",
+        type=int,
+        default=50,
+        help="Purification diffusion steps (default: 50)",
+    )
+    p.add_argument(
+        "--markdiffusion-device",
+        type=str,
+        default=None,
+        help="Purification device: auto|cpu|cuda|mps (default: auto)",
+    )
+    p.add_argument(
+        "--markdiffusion-timeout",
+        type=int,
+        default=3600,
+        help="Purification subprocess timeout in seconds (default: 3600)",
+    )
     args = p.parse_args()
 
     if not args.path.is_file():
@@ -104,6 +148,13 @@ def main() -> int:
             ctrlregen_device=args.ctrlregen_device,
             ctrlregen_seed=args.ctrlregen_seed,
             ctrlregen_timeout=args.ctrlregen_timeout,
+            markdiffusion_dir=args.markdiffusion_dir,
+            markdiffusion_strength=args.markdiffusion_strength,
+            markdiffusion_model=args.markdiffusion_model,
+            markdiffusion_size=args.markdiffusion_size,
+            markdiffusion_steps=args.markdiffusion_steps,
+            markdiffusion_device=args.markdiffusion_device,
+            markdiffusion_timeout=args.markdiffusion_timeout,
         )
     except Exception as e:
         eprint(f"error: {e}")
@@ -135,9 +186,11 @@ def main() -> int:
             )
         if pr is not None:
             if pr.get("available"):
-                eprint(f"CtrlRegen: removed on {pr.get('device', 'unknown device')}")
+                engine = "CtrlRegen" if args.remove_pixel == "ctrlregen" else "DiffusionPurification"
+                eprint(f"{engine}: removed on {pr.get('device', 'unknown device')}")
             else:
-                eprint(f"CtrlRegen: unavailable: {pr.get('error', 'unknown error')}")
+                engine = "CtrlRegen" if args.remove_pixel == "ctrlregen" else "DiffusionPurification"
+                eprint(f"{engine}: unavailable: {pr.get('error', 'unknown error')}")
         if residual:
             eprint("warning: residual C2PA/AI signals may remain")
             for f in result.get("post_findings") or []:

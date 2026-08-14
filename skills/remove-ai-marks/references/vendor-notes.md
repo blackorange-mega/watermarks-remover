@@ -32,9 +32,10 @@ Source: [How Claude marks AI-generated content](https://support.claude.com/en/ar
   - **Data-driven / backdoor** (trigger phrases) → **out of scope**
   - **Generative** (sampling) → Layer B best-effort
 - Productionized in Gemini-scale systems; open research code exists, but **production keys are not public** — this skill does **not** ship a SynthID detector.
+- Optional external verification harness: [`THU-BPM/MarkLLM`](https://github.com/THU-BPM/MarkLLM) (Apache-2.0) reimplements SynthID-Text among other schemes with configurable keys; wired as `detect_text_watermark.py` / `rewrite_text.py --markllm-scheme`. Same-config-only — it verifies a mark you generated under a known config, not Google's production keying.
 - Current frontier production watermarks are **token-by-token** (streaming constraint); paragraph-level robust methods (SemStamp / PostMark) are not deployed yet, which keeps paraphrase-class attacks effective today.
 - Optional external reference: [`aloshdenny/reverse-SynthID`](https://github.com/aloshdenny/reverse-SynthID) provides a reverse-engineered pixel-domain scorer. It is **not bundled** here, is best-effort, and is under a non-commercial Research License; it is not the official Google detector.
-- Optional pixel-domain removal: [`mertizci/noai-watermark`](https://github.com/mertizci/noai-watermark)'s CtrlRegen profile is wired through `clean_image.py --remove-pixel ctrlregen` / `clean_ctrlregen.py`. It is **not bundled** (no LICENSE file → all-rights-reserved), and no local detector certifies the result; the official Google check is the final authority.
+- Optional pixel-domain removal: [`mertizci/noai-watermark`](https://github.com/mertizci/noai-watermark)'s CtrlRegen profile is wired through `clean_image.py --remove-pixel ctrlregen` / `clean_ctrlregen.py`. It is **not bundled** (no LICENSE file → all-rights-reserved), and no local detector certifies the result; the official Google check is the final authority. For Tree-Ring-class marks, the optional MarkDiffusion harness (`markdiffusion_harness.py`, Apache-2.0) adds a same-scheme detector and a blind-regeneration removal engine (`--remove-pixel diffusion`) — see `references/markdiffusion.md`.
 
 **Skill mapping:** same Layer B rewrite attacks (paraphrase / back-translate / structural) used in the literature against sampling watermarks.
 
@@ -50,6 +51,7 @@ Source: [How Claude marks AI-generated content](https://support.claude.com/en/ar
 
 - Classic green-list / red-list sampling bias (Kirchenbauer et al.) and variants.
 - Detectable with the **key** and tokenizer; removal still relies on heavy paraphrase or regeneration.
+- Optional external harness: `MarkLLM` (`detect_text_watermark.py --scheme kgw`) reproduces KGW detection under a config you control, for controlled before/after experiments.
 
 **Skill mapping:** Layer B multi-pass; prefer rewrite with a **different** model family when possible.
 

@@ -19,42 +19,10 @@ from common import (  # noqa: E402
     guard_binary,
     safe_write_text,
 )
-from container_meta import clean_container, detect_container_format  # noqa: E402
-from image_meta import clean_image, detect_format as detect_image_format  # noqa: E402
+from container_meta import clean_container  # noqa: E402
+from format_dispatch import classify  # noqa: E402
+from image_meta import clean_image  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
-CONTAINER_EXTS = {".svg", ".pdf", ".docx", ".odt", ".html", ".htm", ".md", ".markdown", ".mdx"}
-TEXT_EXTS = {
-    ".txt",
-    ".text",
-    ".css",
-    ".js",
-    ".py",
-    ".rs",
-    ".go",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".csv",
-}
-
-
-def classify(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext in IMAGE_EXTS:
-        return "image"
-    if ext in CONTAINER_EXTS:
-        return "container"
-    if ext in TEXT_EXTS:
-        return "text"
-    data = path.read_bytes()
-    if detect_image_format(data) in ("png", "jpeg", "webp"):
-        return "image"
-    if detect_container_format(path, data) != "unknown":
-        return "container"
-    return "text"
 
 
 def main() -> int:
