@@ -32,7 +32,7 @@ def main() -> int:
     p.add_argument(
         "--strip-emoji-glue",
         action="store_true",
-        help="Strip emoji presentation selectors/ZWJ even after an emoji base (paranoid)",
+        help="Paranoid: strip all load-bearing invisibles too (emoji glue, script joiners, flag tags, orthographic Cf)",
     )
     p.add_argument("--stats", action="store_true", help="Print stats JSON to stderr")
     p.add_argument(

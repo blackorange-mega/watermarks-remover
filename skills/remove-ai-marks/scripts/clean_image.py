@@ -109,6 +109,10 @@ def main() -> int:
         eprint(f"error: {e}")
         return 1
 
+    pr = result.get("pixel_removal")
+    residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
+    failed = residual or (pr is not None and not pr.get("available"))
+
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -129,24 +133,16 @@ def main() -> int:
                 f"confidence {result['synthid_after'].get('confidence', 0.0):.3f} "
                 f"(watermarked: {label})"
             )
-        pr = result.get("pixel_removal")
         if pr is not None:
             if pr.get("available"):
                 eprint(f"CtrlRegen: removed on {pr.get('device', 'unknown device')}")
             else:
                 eprint(f"CtrlRegen: unavailable: {pr.get('error', 'unknown error')}")
-
-        failed = False
-        if result["still_has_c2pa"] or result["still_has_ai_metadata"]:
+        if residual:
             eprint("warning: residual C2PA/AI signals may remain")
             for f in result.get("post_findings") or []:
                 eprint(f"  ! {f}")
-            failed = True
-        if pr is not None and not pr.get("available"):
-            failed = True
-        if failed:
-            return 1
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

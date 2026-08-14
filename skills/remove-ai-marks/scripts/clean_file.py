@@ -148,16 +148,16 @@ def main() -> int:
             eprint(f"error: {e}")
             return 1
         result = {"kind": "image", **result}
+        residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
         if args.json:
             print(json.dumps(result, indent=2))
         else:
             eprint(f"wrote {result['output']} ({result['bytes_in']} -> {result['bytes_out']})")
             for a in result["actions"]:
                 eprint(f"  - {a}")
-            if result["still_has_c2pa"] or result["still_has_ai_metadata"]:
+            if residual:
                 eprint("warning: residual C2PA/AI signals may remain")
-                return 1
-        return 0
+        return 1 if residual else 0
 
     try:
         result = clean_container(src, dest)
@@ -165,21 +165,20 @@ def main() -> int:
         eprint(f"error: {e}")
         return 1
     result = {"kind": "container", **result}
+    residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
+    degraded = bool(result.get("meta", {}).get("degraded"))
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         eprint(f"wrote {result['output']} format={result['format']}")
         for a in result["actions"]:
             eprint(f"  - {a}")
-        if result["still_has_c2pa"] or result["still_has_ai_metadata"]:
+        if residual:
             eprint("warning: residual C2PA/AI signals may remain")
             for f in result.get("post_findings") or []:
                 eprint(f"  ! {f}")
-            # degraded PDF copy is not a hard failure if we only warn
-            if result.get("meta", {}).get("degraded"):
-                return 0
-            return 1
-    return 0
+    # A degraded (best-effort) PDF copy warns but is not a hard failure.
+    return 1 if (residual and not degraded) else 0
 
 
 if __name__ == "__main__":

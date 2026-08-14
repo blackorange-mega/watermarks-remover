@@ -43,6 +43,49 @@ Body\u200b text.
     assert any("drop" in a for a in actions)
 
 
+def test_markdown_frontmatter_with_blank_line_does_not_crash():
+    """Regression: a blank line inside frontmatter used to raise IndexError."""
+    text = "---\ntitle: Demo\n\nauthor: you\n---\nBody\n"
+    cleaned, actions = clean_markdown(text)
+    assert "title: Demo" in cleaned
+    assert "author: you" in cleaned
+    assert actions
+
+
+def test_markdown_drops_nested_children_of_dropped_key():
+    """Regression: nested values under a dropped AI key survived the clean."""
+    text = (
+        "---\n"
+        "title: Demo\n"
+        "model:\n"
+        "  name: claude-opus\n"
+        "  version: 4\n"
+        "author: you\n"
+        "---\nBody\n"
+    )
+    cleaned, actions = clean_markdown(text)
+    assert "claude-opus" not in cleaned      # the leak
+    assert "version: 4" not in cleaned
+    assert "title: Demo" in cleaned          # siblings untouched
+    assert "author: you" in cleaned
+    assert any("drop frontmatter key: model" in a for a in actions)
+
+
+def test_markdown_clean_output_is_no_longer_flagged():
+    """Round-trip: re-inspecting a cleaned document reports nothing AI-ish."""
+    text = "---\ntitle: Demo\nmodel:\n  name: claude-opus\ngenerator: Claude\n---\nBody\n"
+    cleaned, _ = clean_markdown(text)
+    _c2, has_ai, findings, _d = inspect_markdown(cleaned)
+    assert not has_ai, findings
+
+
+def test_markdown_preserves_comments_and_non_ai_keys():
+    text = "---\n# editorial notes\ntitle: Demo\ntags:\n  - one\n  - two\n---\nBody\n"
+    cleaned, _ = clean_markdown(text)
+    assert "# editorial notes" in cleaned
+    assert "- one" in cleaned and "- two" in cleaned
+
+
 def test_html_meta_strip():
     html = """<html><head>
 <meta name="generator" content="ChatGPT">

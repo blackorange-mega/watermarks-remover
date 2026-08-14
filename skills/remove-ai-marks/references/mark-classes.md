@@ -15,6 +15,8 @@ Invisible or near-invisible characters, exotic spaces, bidi controls, tag charac
 
 **Removal:** `clean_text.py` / Layer A — deterministic, verifiable.
 
+Load-bearing invisibles are preserved by default so real text is not corrupted: emoji glue (ZWJ/VS after an emoji base), script joiners (ZWNJ/ZWJ inside complex scripts like Persian or Devanagari), flag tag-char sequences, and orthographic Arabic/Syriac `Cf` marks. The same characters between plain ASCII stay carriers and are still stripped. Use `--strip-emoji-glue` for paranoid mode (strips all of them).
+
 Maps to Nature paper “edit-based watermarking.”
 
 ## 2. Generative / statistical text (token sampling)

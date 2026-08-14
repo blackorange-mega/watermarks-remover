@@ -241,6 +241,26 @@ def _is_emoji_base(cp: int) -> bool:
     return False
 
 
+# ZWNJ/ZWJ are orthographic inside complex scripts (Persian می‌روم, Devanagari
+# क्‍ष); flag emoji are an emoji base followed by tag chars (🏴󠁧󠁢󠁳󠁣󠁴󠁿); and a
+# handful of Cf codepoints are normal Arabic/Syriac orthography, not carriers.
+_SCRIPT_JOINERS: frozenset[int] = frozenset({0x200C, 0x200D})
+_TAG_RANGE = range(0xE0020, 0xE0080)
+_ORTHOGRAPHIC_CF: frozenset[int] = frozenset(
+    {0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x06DD, 0x070F, 0x08E2, 0x110BD, 0x110CD}
+)
+
+
+def _is_joining_letter(cp: int) -> bool:
+    """Non-ASCII letter/mark — the neighbour that makes a joiner orthographic."""
+    return cp > 0x7F and unicodedata.category(chr(cp))[0] in ("L", "M")
+
+
+def _is_glue(cp: int) -> bool:
+    """Load-bearing invisible char: emoji glue, script joiner, or flag tag char."""
+    return _is_emoji_glue(cp) or cp in _SCRIPT_JOINERS or cp in _TAG_RANGE
+
+
 def _decide(
     ch: str,
     prev_kept: str | None,
@@ -258,6 +278,13 @@ def _decide(
     cp = ord(ch)
     if _is_emoji_glue(cp) and not strip_emoji_glue:
         if prev_kept is not None and _is_emoji_base(ord(prev_kept)):
+            return ("keep", ch, None)
+    if not strip_emoji_glue:
+        if cp in _SCRIPT_JOINERS and prev_kept is not None and _is_joining_letter(ord(prev_kept)):
+            return ("keep", ch, None)
+        if cp in _TAG_RANGE and prev_kept is not None and _is_emoji_base(ord(prev_kept)):
+            return ("keep", ch, None)
+        if cp in _ORTHOGRAPHIC_CF:
             return ("keep", ch, None)
     if _is_strip_cp(cp):
         return ("strip", "", _strip_kind(cp))
@@ -335,9 +362,9 @@ def inspect_text(
             strip_emoji_glue=strip_emoji_glue,
         )
         if kind is None:
-            # Kept; emoji glue does not advance the "previous kept" base so
-            # ZWJ chains (❤️‍🔥) continue to bind correctly.
-            if not _is_emoji_glue(ord(ch)):
+            # Kept; glue (emoji/script joiner/tag) does not advance the
+            # "previous kept" base so ZWJ chains and flag runs stay bound.
+            if not _is_glue(ord(ch)):
                 prev_kept = out_char
             continue
         key = (ord(ch), kind)
@@ -366,7 +393,7 @@ def inspect_text(
         "Layer A only: invisible/format Unicode and space homoglyphs (edit-based carriers).",
         "Statistical (token-sampling) watermarks are not detectable here; use Layer B rewrite.",
         "Inspect kinds: strip, bidi, tag_chars, variation_selector, zwj_family, space, confusable, other_cf.",
-        "Emoji presentation glue (ZWJ/VS15/VS16 after an emoji base) is preserved by default; use --strip-emoji-glue for paranoid mode.",
+        "Load-bearing invisibles are preserved by default: emoji glue (ZWJ/VS after an emoji base), script joiners (ZWNJ/ZWJ inside complex scripts), flag tag chars, and orthographic Arabic/Syriac Cf marks. Use --strip-emoji-glue for paranoid mode (strips them all).",
     ]
     if not hits:
         notes.append(
@@ -400,9 +427,9 @@ def clean_text(
         )
         if action == "keep":
             out_chars.append(out_char)
-            # Emoji glue does not advance the "previous kept" base, so a
-            # ZWJ chain (❤️‍🔥) stays bound to its original emoji base.
-            if not _is_emoji_glue(ord(ch)):
+            # Glue (emoji/script joiner/tag) does not advance the "previous
+            # kept" base, so ZWJ chains (❤️‍🔥) and flag runs stay bound.
+            if not _is_glue(ord(ch)):
                 prev_kept = out_char
         elif action == "replace":
             out_chars.append(out_char)

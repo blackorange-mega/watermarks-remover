@@ -117,3 +117,36 @@ def test_inspect_strip_emoji_glue_flag():
     raw = "\u2696\ufe0f"
     report = inspect_text(raw, strip_emoji_glue=True)
     assert report.suspicious_total >= 1
+
+
+def test_clean_preserves_script_joiners():
+    # Persian mi-ravam (ZWNJ) and a Devanagari conjunct (ZWJ) \u2014 orthographic.
+    for raw in ("\u0645\u06cc\u200c\u0631\u0648\u0645", "\u0915\u094d\u200d\u0937"):
+        cleaned, _ = clean_text(raw)
+        assert cleaned == raw
+
+
+def test_clean_preserves_flag_tag_sequence():
+    # Scotland flag: emoji base U+1F3F4 + tag chars ending in U+E007F.
+    raw = "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F"
+    cleaned, _ = clean_text(raw)
+    assert cleaned == raw
+
+
+def test_clean_preserves_orthographic_arabic_cf():
+    raw = "x\u0600y\u06ddz"  # ARABIC NUMBER SIGN, END OF AYAH
+    cleaned, _ = clean_text(raw)
+    assert cleaned == raw
+
+
+def test_clean_still_strips_joiners_between_latin():
+    # ZWJ/ZWNJ next to ASCII is a carrier, not orthography \u2014 still removed.
+    for raw in ("a\u200db", "a\u200cb", "ab\u200c"):
+        cleaned, _ = clean_text(raw)
+        assert "\u200c" not in cleaned and "\u200d" not in cleaned
+
+
+def test_strip_emoji_glue_flag_restores_blanket_strip():
+    cleaned, _ = clean_text("\u0645\u06cc\u200c\u0631", strip_emoji_glue=True)
+    assert "\u200c" not in cleaned
+    assert clean_text("x\u0600y", strip_emoji_glue=True)[0] == "xy"

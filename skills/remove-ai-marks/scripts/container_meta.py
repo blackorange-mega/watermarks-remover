@@ -186,31 +186,43 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
     block = m.group(1)
     body = text[m.end() :]
     kept: list[str] = []
+    dropping = False  # inside the nested block of a dropped top-level key
     for line in block.splitlines():
-        if not line.strip() or line.strip().startswith("#") or line[0] in (" ", "\t", "-"):
-            # drop nested lines only if previous key was dropped — simple approach:
-            # keep nested only if we kept a parent; track with flag
-            if kept and line[0] in (" ", "\t", "-"):
-                kept.append(line)
-            elif not line.strip() or line.strip().startswith("#"):
+        stripped = line.strip()
+
+        # Blank lines and comments belong to whichever block we are inside.
+        if not stripped or stripped.startswith("#"):
+            if not dropping:
                 kept.append(line)
             continue
+
+        # Continuation lines (nested mappings, list items) follow their parent.
+        if line[0] in (" ", "\t", "-"):
+            if not dropping:
+                kept.append(line)
+            continue
+
         km = re.match(r"^([A-Za-z0-9_.-]+)\s*:", line)
-        if km:
-            key = km.group(1)
-            if key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
-                actions.append(f"drop frontmatter key: {key}")
-                continue
-            val = line.split(":", 1)[1] if ":" in line else ""
-            if AI_META_NAME_RE.search(val):
-                actions.append(f"drop frontmatter key (value hit): {key}")
-                continue
+        if not km:
+            dropping = False
             kept.append(line)
-        else:
-            kept.append(line)
+            continue
+
+        key = km.group(1)
+        val = line.split(":", 1)[1] if ":" in line else ""
+        if key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
+            actions.append(f"drop frontmatter key: {key}")
+            dropping = True
+            continue
+        if AI_META_NAME_RE.search(val):
+            actions.append(f"drop frontmatter key (value hit): {key}")
+            dropping = True
+            continue
+
+        dropping = False
+        kept.append(line)
     if not actions:
         actions.append("no AI frontmatter keys removed")
-    # strip trailing empty nested orphans already handled
     new_block = "\n".join(kept).strip("\n")
     if new_block:
         out = f"---\n{new_block}\n---\n{body}"
