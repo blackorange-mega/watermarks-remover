@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
+SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import audit_website  # noqa: E402
@@ -106,6 +106,17 @@ def test_scan_file_text_and_html(tmp_path: Path):
     item = scan_file(html)
     assert item["kind"] == "html"
     assert not is_actionable(item)
+
+
+def test_scan_file_container_layer_a_reported_once(tmp_path: Path):
+    """Layer A body findings come from inspect_container() exactly once."""
+    md = tmp_path / "post.md"
+    md.write_text("# Title\n\nHello\u200bWorld\n", encoding="utf-8")
+    item = scan_file(md)
+    layer_a = [f for f in item["findings"] if "layer-a" in f]
+    assert len(layer_a) == 1
+    assert item["suspicious_total"] == 1
+    assert is_actionable(item)
 
 
 def test_aggregate_summary():

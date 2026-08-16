@@ -336,18 +336,22 @@ def call_openai_compatible(
     api_key: str | None,
     timeout: float,
     temperature: float,
+    reasoning_effort: str | None = None,
 ) -> str:
     url = base_url.rstrip("/") + "/v1/chat/completions"
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    payload: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     data = _http_json(
         url,
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-        },
+        payload,
         headers,
         timeout,
     )
@@ -375,6 +379,7 @@ def rewrite(
     temperature: float,
     candidates: int,
     allow_remote: bool = False,
+    reasoning_effort: str | None = None,
     markllm_scheme: str | None = None,
     markllm_dir: str | None = None,
     markllm_model: str | None = None,
@@ -390,6 +395,8 @@ def rewrite(
         "prompt_chars": len(prompt),
         "input_chars": len(text),
     }
+    if reasoning_effort:
+        info["reasoning_effort"] = reasoning_effort
 
     markllm: dict | None = None
     if markllm_scheme:
@@ -427,7 +434,9 @@ def rewrite(
             outs.append(call_ollama(base_url, model, prompt, timeout, temperature))
         elif backend == "openai-compatible":
             outs.append(
-                call_openai_compatible(base_url, model, prompt, api_key, timeout, temperature)
+                call_openai_compatible(
+                    base_url, model, prompt, api_key, timeout, temperature, reasoning_effort
+                )
             )
         else:
             raise SystemExit(f"unknown backend: {backend}")
@@ -492,6 +501,14 @@ def main() -> int:
         default=None,
         help="Allow non-loopback rewrite endpoints (default: deny; "
         "WATERMARKS_REWRITE_ALLOW_REMOTE=1 has the same effect)",
+    )
+    p.add_argument(
+        "--reasoning-effort",
+        choices=("none", "low", "medium", "high", "off"),
+        default=_env("WATERMARKS_REWRITE_REASONING_EFFORT", "none"),
+        help="OpenAI-compatible reasoning_effort; 'none' skips chain-of-thought "
+        "(reasoning models like deepseek-v4-flash otherwise burn minutes on a "
+        "rewrite). 'off' omits the parameter entirely.",
     )
     # NOTE: no --api-key flag on purpose — keys on argv are visible in `ps`
     # and shell history. Set WATERMARKS_REWRITE_API_KEY instead.
@@ -572,6 +589,9 @@ def main() -> int:
             temperature=args.temperature,
             candidates=args.candidates,
             allow_remote=allow_remote,
+            reasoning_effort=(
+                None if args.reasoning_effort == "off" else args.reasoning_effort
+            ),
             markllm_scheme=args.markllm_scheme,
             markllm_dir=args.markllm_dir,
             markllm_model=args.markllm_model,

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import io
+import json
+import posixpath
+import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
+SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from container_meta import (  # noqa: E402
@@ -23,6 +29,15 @@ from container_meta import (  # noqa: E402
     inspect_markdown,
     inspect_svg,
 )
+
+
+def _run(script: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / script), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
 
 def test_markdown_frontmatter():
@@ -204,6 +219,77 @@ def test_docx_strips_app_and_customxml(tmp_path: Path):
         assert "Claude" not in app
 
 
+def _dangling_rels(zip_bytes: bytes) -> list[str]:
+    """Return every internal relationship whose target part is missing."""
+    bad: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = set(zf.namelist())
+        for rels in (n for n in names if n.endswith(".rels")):
+            base = posixpath.dirname(posixpath.dirname(rels))
+            text = zf.read(rels).decode()
+            for m in re.finditer(
+                r'<Relationship\b[^>]*Target="([^"]*)"[^>]*/>', text, re.I
+            ):
+                target, tag = m.group(1), m.group(0)
+                if re.search(r"\bTargetMode\s*=", tag, re.I):
+                    continue  # external
+                if target.startswith("/"):
+                    resolved = posixpath.normpath(target.lstrip("/"))
+                else:
+                    resolved = posixpath.normpath(posixpath.join(base, target))
+                if resolved not in ("", ".") and resolved not in names:
+                    bad.append(f"{rels} -> {target}")
+    return bad
+
+
+def _make_docx_with_rels() -> bytes:
+    """DOCX whose document rels reference customXml, a kept part and a URL."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/customXml/item1.xml" ContentType="application/xml"/>
+</Types>""",
+        )
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>',
+        )
+        zf.writestr(
+            "customXml/item1.xml",
+            '<?xml version="1.0"?><root>c2pa contentcredentials</root>',
+        )
+        zf.writestr(
+            "word/_rels/document.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="document.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/>
+</Relationships>""",
+        )
+    return buf.getvalue()
+
+
+def test_docx_dropped_customxml_prunes_dangling_relationships():
+    data = _make_docx_with_rels()
+    assert _dangling_rels(data) == []
+    cleaned, actions = clean_docx(data)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        names = zf.namelist()
+        assert not any(n.startswith("customXml/") for n in names)
+        rels = zf.read("word/_rels/document.xml.rels").decode()
+        assert "../customXml/item1.xml" not in rels
+        assert 'Target="document.xml"' in rels
+        assert 'TargetMode="External"' in rels
+    assert _dangling_rels(cleaned) == []
+    assert any("prune dangling relationships" in a for a in actions)
+
+
 def _make_docx_with_body_text(body_text: str = "Claude wrote this.") -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -248,6 +334,197 @@ def test_docx_metadata_vendor_word_is_still_flagged():
     assert any("Claude" in f for f in findings)
 
 
+def _make_docx_with_docprops() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+  <Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>
+</Types>""",
+        )
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>',
+        )
+        zf.writestr(
+            "docProps/core.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title>My Document</dc:title>
+  <dc:creator>ChatGPT</dc:creator>
+  <cp:lastModifiedBy>Claude</cp:lastModifiedBy>
+  <dc:description>Generated by AI</dc:description>
+  <cp:keywords>ai, model</cp:keywords>
+  <dc:subject>artificial intelligence</dc:subject>
+  <cp:category>report</cp:category>
+</cp:coreProperties>""",
+        )
+        zf.writestr(
+            "docProps/app.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Application>ChatGPT</Application>
+  <AppVersion>16.0</AppVersion>
+  <Company>OpenAI</Company>
+  <Manager>Someone</Manager>
+</Properties>""",
+        )
+        zf.writestr(
+            "docProps/custom.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Client"><vt:lpwstr>Acme</vt:lpwstr></property>
+</Properties>""",
+        )
+    return buf.getvalue()
+
+
+def _make_docx_with_invisible_body() -> bytes:
+    buf = io.BytesIO()
+    document = (
+        '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        "<w:p><w:r><w:t>Hello\u200b world\u2060 with\u00a0space </w:t></w:r></w:p>"
+        '<w:p><w:r><w:instrText xml:space="preserve"> FIELD \u200b KEEP </w:instrText></w:r></w:p>'
+        '<w:p><w:r><w:t xml:space="preserve">keep\u200bme </w:t></w:r></w:p>'
+        "</w:body></w:document>"
+    )
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+</Types>""",
+        )
+        zf.writestr("word/document.xml", document)
+        zf.writestr(
+            "docProps/core.xml",
+            '<?xml version="1.0"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"></cp:coreProperties>',
+        )
+    return buf.getvalue()
+
+
+def test_docx_scrubs_docprops_provenance_fields_unconditionally():
+    import xml.etree.ElementTree as ET
+
+    data = _make_docx_with_docprops()
+    cleaned, actions = clean_docx(data)
+
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        names = zf.namelist()
+        assert "docProps/core.xml" in names
+        assert "docProps/app.xml" in names
+        assert "docProps/custom.xml" not in names
+        ct = zf.read("[Content_Types].xml").decode()
+        assert 'PartName="/docProps/custom.xml"' not in ct
+
+        core = zf.read("docProps/core.xml").decode()
+        app = zf.read("docProps/app.xml").decode()
+
+    # Every provenance field is emptied...
+    for field in ("dc:creator", "cp:lastModifiedBy", "dc:description", "cp:keywords", "dc:subject", "cp:category"):
+        assert f"<{field}></{field}>" in core or f"<{field}/>" in core
+    for field in ("Application", "AppVersion", "Company", "Manager"):
+        assert f"<{field}></{field}>" in app or f"<{field}/>" in app
+    # ...while dc:title survives
+    assert "<dc:title>My Document</dc:title>" in core
+    assert "ChatGPT" not in core
+    assert "Generated by AI" not in core
+    assert "OpenAI" not in app
+
+    # The output docProps remain well-formed XML.
+    ET.fromstring(core)
+    ET.fromstring(app)
+
+    assert any("scrub docProps/core.xml field dc:creator" in a for a in actions)
+    assert any("drop part docProps/custom.xml" in a for a in actions)
+
+
+def test_docx_docprops_scrub_clears_residual_warning(tmp_path: Path):
+    src = tmp_path / "in.docx"
+    src.write_bytes(_make_docx_with_docprops())
+    dest = tmp_path / "out.docx"
+    result = clean_container(src, dest)
+    assert result["format"] == "docx"
+    assert not result["still_has_ai_metadata"]
+    assert not any("docProps/core.xml" in f for f in result["post_findings"])
+
+
+def test_docx_layer_a_strips_invisible_body_chars():
+    data = _make_docx_with_invisible_body()
+    cleaned, actions = clean_docx(data)
+    assert any(a.startswith("layer A text: removed=") for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        doc = zf.read("word/document.xml").decode()
+        # ZWSP / word joiner / NBSP removed from w:t runs...
+        assert "Hello\u200b" not in doc
+        assert "world\u2060" not in doc
+        assert "with\u00a0space" not in doc
+        # ...NBSP was replaced with a regular space, trailing space keeps preserve
+        assert '<w:t xml:space="preserve">Hello world with space </w:t>' in doc
+        # field codes are never touched
+        assert " FIELD \u200b KEEP " in doc
+        # existing xml:space is retained on cleaned runs
+        assert '<w:t xml:space="preserve">keepme </w:t>' in doc
+
+
+def test_docx_layer_a_can_be_disabled():
+    data = _make_docx_with_invisible_body()
+    cleaned, actions = clean_docx(data, also_layer_a_text=False)
+    assert not any(a.startswith("layer A text:") for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        assert "Hello\u200b" in zf.read("word/document.xml").decode()
+
+
+def test_docx_layer_a_via_clean_container(tmp_path: Path):
+    src = tmp_path / "in.docx"
+    src.write_bytes(_make_docx_with_invisible_body())
+    dest = tmp_path / "out.docx"
+    result = clean_container(src, dest)
+    assert any(a.startswith("layer A text: removed=") for a in result["actions"])
+    with zipfile.ZipFile(dest) as zf:
+        doc = zf.read("word/document.xml").decode()
+        assert "Hello\u200b" not in doc
+        assert " FIELD \u200b KEEP " in doc
+
+
+def _make_odt_with_invisible_text() -> bytes:
+    buf = io.BytesIO()
+    content = (
+        '<?xml version="1.0"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">'
+        "<office:body><office:text>"
+        '<text:p text:style-name="P1">Hello\u200b <text:span>world\u2060</text:span>!</text:p>'
+        "</office:text></office:body></office:document-content>"
+    )
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+        zf.writestr("meta.xml", '<?xml version="1.0"?><office:document-meta/>')
+        zf.writestr("content.xml", content)
+        zf.writestr("META-INF/manifest.xml", '<?xml version="1.0"?><manifest:manifest/>')
+    return buf.getvalue()
+
+
+def test_odt_layer_a_strips_invisible_text():
+    data = _make_odt_with_invisible_text()
+    cleaned, actions = clean_odt(data)
+    assert any(a.startswith("layer A text: removed=") for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        content = zf.read("content.xml").decode()
+        assert "\u200b" not in content
+        assert "\u2060" not in content
+        assert "<text:span>world</text:span>" in content
+
+
 def _make_odt(generator: str = "Anthropic Claude") -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -287,6 +564,43 @@ def test_clean_container_markdown_file(tmp_path: Path):
     assert "generator" not in body
     assert "\u200b" not in body
     assert result["format"] == "markdown"
+
+
+def test_inspect_container_reports_layer_a_body_text(tmp_path: Path):
+    """inspect must flag invisible carriers that clean would strip.
+
+    Regression: markdown/html routed to the container inspector, which never
+    ran the Layer A scan, so identical bytes were reported suspicious as .txt
+    and clean as .md while clean_container() went on to remove them.
+    """
+    body = "Hello​world‌ test⁠end.\n"
+    for name in ("x.md", "x.html"):
+        src = tmp_path / name
+        src.write_text(body, encoding="utf-8")
+        report = inspect_container(src)
+        assert report.layer_a_total == 3, name
+        assert report.to_dict()["suspicious_total"] == 3, name
+        codepoints = {h["codepoint"] for h in report.layer_a_hits}
+        assert {"U+200B", "U+200C", "U+2060"} <= codepoints, name
+        assert any(f.startswith("layer-a:") for f in report.findings), name
+
+
+def test_inspect_container_clean_leaves_no_layer_a(tmp_path: Path):
+    """The post-clean re-inspect must come back with nothing left."""
+    src = tmp_path / "x.md"
+    src.write_text("Hi​‌there\n", encoding="utf-8")
+    dest = tmp_path / "x.cleaned.md"
+    clean_container(src, dest)
+    assert inspect_container(dest).layer_a_total == 0
+
+
+def test_inspect_container_clean_file_stays_clean(tmp_path: Path):
+    """No false positives on ordinary prose."""
+    src = tmp_path / "x.md"
+    src.write_text("# Title\n\nOrdinary prose, nothing hidden.\n", encoding="utf-8")
+    report = inspect_container(src)
+    assert report.layer_a_total == 0
+    assert report.layer_a_hits == []
 
 
 def test_inspect_container_svg(tmp_path: Path):
@@ -343,3 +657,36 @@ def test_pdf_degraded_clean_without_crash(tmp_path: Path):
     assert dest.is_file()
     assert actions
     assert meta.get("mode") in ("exiftool", "stdlib-xmp", "copy")
+
+
+def test_clean_container_accepts_explicit_fmt(tmp_path: Path):
+    """A .bak source with no detectable magic bytes still cleans when fmt is pinned."""
+    src = tmp_path / "backup.md.bak"
+    src.write_text("---\ngenerator: OpenAI\n---\nHi\u200b\n", encoding="utf-8")
+    dest = tmp_path / "out.md"
+    result = clean_container(src, dest, fmt="markdown")
+    assert result["format"] == "markdown"
+    body = dest.read_text(encoding="utf-8")
+    assert "generator" not in body
+    assert "\u200b" not in body
+
+
+@pytest.mark.parametrize(
+    "ext,make_bytes",
+    [
+        ("md", lambda: (Path(__file__).resolve().parent / "fixtures" / "sample_ai.md").read_bytes()),
+        ("html", lambda: (Path(__file__).resolve().parent / "fixtures" / "sample_ai.html").read_bytes()),
+        ("svg", lambda: (Path(__file__).resolve().parent / "fixtures" / "sample_meta.svg").read_bytes()),
+        ("docx", _make_docx_with_app),
+        ("odt", _make_odt),
+    ],
+)
+def test_clean_file_in_place_for_every_container_ext(tmp_path: Path, ext: str, make_bytes):
+    path = tmp_path / f"a.{ext}"
+    path.write_bytes(make_bytes())
+    r = _run("clean_file.py", str(path), "--in-place", "--json")
+    assert r.returncode == 0, r.stderr
+    assert path.with_suffix(path.suffix + ".bak").is_file()
+    data = json.loads(r.stdout)
+    assert data["kind"] == "container"
+    assert data["format"] == {"docx": "docx", "odt": "odt", "svg": "svg", "md": "markdown", "html": "html"}[ext]

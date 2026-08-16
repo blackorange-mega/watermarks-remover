@@ -7,6 +7,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 from __future__ import annotations
 
 import io
+import posixpath
 import re
 import subprocess
 import zipfile
@@ -67,6 +68,12 @@ class ContainerInspectReport:
     tools: dict[str, Any] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Layer A (invisible/format Unicode) scan of the text body, populated only
+    # for the formats clean_container() actually scrubs. Without it, inspect
+    # reported a markdown/html file carrying invisible carriers as clean while
+    # clean then went on to remove them.
+    layer_a_total: int = 0
+    layer_a_hits: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +88,10 @@ class ContainerInspectReport:
             "tools": self.tools,
             "details": self.details,
             "notes": self.notes,
+            # Same key as TextInspectReport so every caller — including the
+            # HTTP server's `suspicious` flag — reads both report kinds alike.
+            "suspicious_total": self.layer_a_total,
+            "layer_a_hits": self.layer_a_hits,
         }
 
 
@@ -425,6 +436,22 @@ DOCX_CUSTOM_PREFIXES = (
     "docProps/",
 )
 
+# Provenance fields in docProps/core.xml and docProps/app.xml that always come
+# out empty. dc:title is deliberately not listed: it is the document's own
+# heading, not provenance.
+DOCX_SCRUB_FIELDS = (
+    ("dc:creator", "dc:creator"),
+    ("cp:lastModifiedBy", "cp:lastModifiedBy"),
+    ("dc:description", "dc:description"),
+    ("cp:keywords", "cp:keywords"),
+    ("dc:subject", "dc:subject"),
+    ("cp:category", "cp:category"),
+    ("Application", "Application"),
+    ("AppVersion", "AppVersion"),
+    ("Company", "Company"),
+    ("Manager", "Manager"),
+)
+
 
 def _zip_namelist(data: bytes) -> list[str]:
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -483,13 +510,108 @@ def inspect_docx(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(parts)}
 
 
-def clean_docx(data: bytes) -> tuple[bytes, list[str]]:
+def _scrub_docx_text(xml_text: str) -> tuple[str, int, int]:
+    """Run Layer A over the ``<w:t>`` text runs of a DOCX part.
+
+    Only ``w:t`` nodes are touched: field codes (``w:instrText``), run/paragraph
+    properties and the surrounding XML are left byte-identical. If leading or
+    trailing whitespace survives the clean, the node keeps
+    ``xml:space="preserve"`` so Word does not trim it.
+    """
+    from text_unicode import clean_text  # local import to avoid cycles
+
+    removed = 0
+    replaced = 0
+
+    def _repl(m: re.Match[str]) -> str:
+        nonlocal removed, replaced
+        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
+        new_inner, stats = clean_text(inner)
+        if not (stats["removed_count"] or stats["replaced_count"]):
+            return m.group(0)
+        removed += stats["removed_count"]
+        replaced += stats["replaced_count"]
+        if (new_inner[:1].isspace() or new_inner[-1:].isspace()) and "xml:space" not in open_tag:
+            open_tag = open_tag[:-1] + ' xml:space="preserve">'
+        return open_tag + new_inner + close_tag
+
+    new = re.sub(r"(<w:t\b[^>]*>)(.*?)(</w:t>)", _repl, xml_text, flags=re.S)
+    return new, removed, replaced
+
+
+def _scrub_odt_text(xml_text: str) -> tuple[str, int, int]:
+    """Run Layer A over ODF paragraph text (``text:p`` content, incl. spans).
+
+    ``text:span``/``text:tab``/``text:s`` children live inside the paragraph,
+    so cleaning the paragraph content covers the visible text. The markup
+    itself is untouched.
+    """
+    from text_unicode import clean_text  # local import to avoid cycles
+
+    removed = 0
+    replaced = 0
+
+    def _repl(m: re.Match[str]) -> str:
+        nonlocal removed, replaced
+        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
+        new_inner, stats = clean_text(inner)
+        if not (stats["removed_count"] or stats["replaced_count"]):
+            return m.group(0)
+        removed += stats["removed_count"]
+        replaced += stats["replaced_count"]
+        return open_tag + new_inner + close_tag
+
+    new = re.sub(r"(<text:p\b[^>]*>)(.*?)(</text:p>)", _repl, xml_text, flags=re.S)
+    return new, removed, replaced
+
+
+def _prune_dangling_relationships(
+    rels_name: str, raw: bytes, kept_names: set[str]
+) -> tuple[bytes, int]:
+    """Drop <Relationship> entries whose internal target part no longer exists.
+
+    Removing a part (e.g. a customXml tree) must also remove the relationships
+    that point at it, or the package is malformed: python-docx refuses to open
+    it and Word offers to repair it. External relationships (``TargetMode``)
+    and the package root (``Target="/"``) are left alone. ``rels_name`` is the
+    archive member like ``word/_rels/document.xml.rels``; ``kept_names`` is the
+    set of archive members that survive cleaning.
+    """
+    base = posixpath.dirname(posixpath.dirname(rels_name))
+    text = raw.decode("utf-8", errors="replace")
+    dropped = [0]
+
+    def _target_attr(tag: str) -> str:
+        m = re.search(r'\bTarget\s*=\s*"([^"]*)"', tag, re.I)
+        return m.group(1) if m else ""
+
+    def _drop(m: re.Match[str]) -> str:
+        tag = m.group(0)
+        if re.search(r"\bTargetMode\s*=", tag, re.I):
+            return tag  # external (http / mailto / ...) — never pruned
+        target = _target_attr(tag)
+        if target.startswith("/"):
+            resolved = posixpath.normpath(target.lstrip("/"))
+        else:
+            resolved = posixpath.normpath(posixpath.join(base, target))
+        if resolved in ("", "."):
+            return tag  # points at the package root
+        if resolved in kept_names:
+            return tag
+        dropped[0] += 1
+        return ""
+
+    new = re.sub(r"<Relationship\b[^>]*/>", _drop, text, flags=re.I)
+    return new.encode("utf-8"), dropped[0]
+
+
+def clean_docx(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
     actions: list[str] = []
-    out_buf = io.BytesIO()
     budget = [0]
-    with zipfile.ZipFile(io.BytesIO(data)) as zin, zipfile.ZipFile(
-        out_buf, "w", compression=zipfile.ZIP_DEFLATED
-    ) as zout:
+    layer_removed = 0
+    layer_replaced = 0
+    kept: list[tuple[zipfile.ZipInfo, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zin:
         for info in zin.infolist():
             name = info.filename
             _check_zip_budget(info, budget)
@@ -500,55 +622,27 @@ def clean_docx(data: bytes) -> tuple[bytes, list[str]]:
                 actions.append(f"drop part {name}")
                 continue
             if name in DOCX_META_PARTS or name.startswith("docProps/"):
-                text = raw.decode("utf-8", errors="replace")
-                # Scrub known AI generator fields via simple regex on XML text nodes
-                new = text
-                for pat, repl, label in (
-                    (
-                        r"(<dc:creator[^>]*>)(.*?)(</dc:creator>)",
-                        None,
-                        "dc:creator",
-                    ),
-                    (
-                        r"(<cp:lastModifiedBy[^>]*>)(.*?)(</cp:lastModifiedBy>)",
-                        None,
-                        "cp:lastModifiedBy",
-                    ),
-                    (
-                        r"(<Application[^>]*>)(.*?)(</Application>)",
-                        None,
-                        "Application",
-                    ),
-                    (
-                        r"(<AppVersion[^>]*>)(.*?)(</AppVersion>)",
-                        None,
-                        "AppVersion",
-                    ),
-                ):
-                    def _sub(m: re.Match[str], _label=label) -> str:
-                        inner = m.group(2)
-                        if AI_META_NAME_RE.search(inner) or AI_META_NAME_RE.search(_label):
-                            actions.append(f"scrub {name} field {_label}")
-                            return m.group(1) + m.group(3)
-                        # Always clear Application if it looks like AI
-                        if _label in ("Application", "AppVersion") and re.search(
-                            r"claude|openai|anthropic|gemini|chatgpt|synthid|copilot",
-                            inner,
-                            re.I,
-                        ):
-                            actions.append(f"scrub {name} field {_label}")
-                            return m.group(1) + m.group(3)
-                        return m.group(0)
-
-                    new = re.sub(pat, _sub, new, flags=re.I | re.DOTALL)
-                # Drop custom.xml entirely if AI-ish
-                if name.endswith("custom.xml") and (
-                    _blob_hits(raw)[1] or AI_META_NAME_RE.search(text)
-                ):
+                # docProps/custom.xml holds arbitrary user properties — a
+                # provenance channel. The part is optional, so drop it whole.
+                if name.endswith("custom.xml"):
                     actions.append(f"drop part {name}")
                     continue
+                text = raw.decode("utf-8", errors="replace")
+                # Empty the provenance fields unconditionally (dc:title is not
+                # in DOCX_SCRUB_FIELDS). Keeping the tags keeps the XML schema
+                # valid; Word tolerates empty core/app properties.
+                new = text
+                for tag, label in DOCX_SCRUB_FIELDS:
+                    pat = rf"(<{tag}\b[^>]*>)(.*?)(</{tag}>)"
+
+                    def _empty(m: re.Match[str], _label=label) -> str:
+                        if m.group(2):
+                            actions.append(f"scrub {name} field {_label}")
+                        return m.group(1) + m.group(3)
+
+                    new = re.sub(pat, _empty, new, flags=re.I | re.DOTALL)
                 raw = new.encode("utf-8")
-            # content types: leave as-is (removing overrides for dropped customXml is nice-to-have)
+            # content types: remove overrides for parts that no longer exist
             if name == "[Content_Types].xml":
                 text = raw.decode("utf-8", errors="replace")
                 new, n = re.subn(
@@ -559,7 +653,42 @@ def clean_docx(data: bytes) -> tuple[bytes, list[str]]:
                 if n:
                     actions.append(f"drop Content_Types customXml overrides x{n}")
                     raw = new.encode("utf-8")
+                new, n = re.subn(
+                    r'<Override\b[^>]*PartName="/docProps/custom\.xml"[^>]*/>',
+                    "",
+                    raw.decode("utf-8", errors="replace"),
+                )
+                if n:
+                    actions.append(f"drop Content_Types custom.xml override x{n}")
+                    raw = new.encode("utf-8")
+            # Layer A over the visible body: headers/footers/footnotes included.
+            if also_layer_a_text and name.startswith("word/") and name.endswith(".xml"):
+                text = raw.decode("utf-8", errors="replace")
+                new, r, rp = _scrub_docx_text(text)
+                if r or rp:
+                    layer_removed += r
+                    layer_replaced += rp
+                    raw = new.encode("utf-8")
+            kept.append((info, raw))
+
+    # Removing parts must not leave relationships pointing at them: prune every
+    # rels member against the set of parts that actually survive.
+    kept_names = {info.filename for info, _ in kept}
+    final: list[tuple[zipfile.ZipInfo, bytes]] = []
+    for info, raw in kept:
+        if info.filename.endswith(".rels"):
+            new_raw, n = _prune_dangling_relationships(info.filename, raw, kept_names)
+            if n:
+                actions.append(f"prune dangling relationships x{n} in {info.filename}")
+            raw = new_raw
+        final.append((info, raw))
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info, raw in final:
             zout.writestr(info, raw)
+    if layer_removed or layer_replaced:
+        actions.append(f"layer A text: removed={layer_removed} replaced={layer_replaced}")
     if not actions:
         actions.append("no DOCX metadata parts removed")
     return out_buf.getvalue(), actions
@@ -592,10 +721,12 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {}
 
 
-def clean_odt(data: bytes) -> tuple[bytes, list[str]]:
+def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
     actions: list[str] = []
     out_buf = io.BytesIO()
     budget = [0]
+    layer_removed = 0
+    layer_replaced = 0
     with zipfile.ZipFile(io.BytesIO(data)) as zin, zipfile.ZipFile(
         out_buf, "w", compression=zipfile.ZIP_DEFLATED
     ) as zout:
@@ -638,7 +769,17 @@ def clean_odt(data: bytes) -> tuple[bytes, list[str]]:
                 ):
                     actions.append(f"drop part {name} (AI/C2PA markers)")
                     continue
+            # Layer A over the visible paragraph text of the body part.
+            if also_layer_a_text and name == "content.xml":
+                text = raw.decode("utf-8", errors="replace")
+                new, r, rp = _scrub_odt_text(text)
+                if r or rp:
+                    layer_removed += r
+                    layer_replaced += rp
+                    raw = new.encode("utf-8")
             zout.writestr(info, raw)
+    if layer_removed or layer_replaced:
+        actions.append(f"layer A text: removed={layer_removed} replaced={layer_replaced}")
     if not actions:
         actions.append("no ODT metadata removed")
     return out_buf.getvalue(), actions
@@ -818,14 +959,31 @@ def inspect_container(path: Path) -> ContainerInspectReport:
     elif fmt == "odt":
         has_c2pa, has_ai, findings, details = inspect_odt(data)
     elif fmt == "html":
-        text = data.decode("utf-8", errors="replace")
-        has_c2pa, has_ai, findings, details = inspect_html(text)
+        # surrogateescape, not replace: clean_container() decodes the same way,
+        # and U+FFFD substitutions would make the two disagree on the counts.
+        body = data.decode("utf-8", errors="surrogateescape")
+        has_c2pa, has_ai, findings, details = inspect_html(body)
     elif fmt == "markdown":
-        text = data.decode("utf-8", errors="replace")
-        has_c2pa, has_ai, findings, details = inspect_markdown(text)
+        body = data.decode("utf-8", errors="surrogateescape")
+        has_c2pa, has_ai, findings, details = inspect_markdown(body)
     else:
         has_c2pa, has_ai, findings = False, False, [f"unsupported container: {fmt}"]
         details = {"unsupported": True}
+
+    # Layer A body scan for exactly the formats clean_container() scrubs, so
+    # inspect predicts clean rather than contradicting it.
+    layer_a_total = 0
+    layer_a_hits: list[dict] = []
+    if fmt in ("markdown", "html"):
+        from text_unicode import inspect_text  # local import to avoid cycles
+
+        ta = inspect_text(body).to_dict()
+        layer_a_total = ta["suspicious_total"]
+        layer_a_hits = ta["hits"]
+        for h in layer_a_hits:
+            findings.append(
+                f"layer-a: {h['codepoint']} {h['label']} x{h['count']} ({h['kind']})"
+            )
 
     notes: list[str] = []
     if fmt == "pdf":
@@ -834,6 +992,11 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         notes.append("DOCX: only metadata/provenance parts are scanned; visible body text is ignored")
     if "unsupported" in details:
         notes.append(f"format not fully inspected: {fmt}")
+    if layer_a_total:
+        notes.append(
+            f"layer A: {layer_a_total} invisible/format codepoint(s) in body text; "
+            "clean removes these"
+        )
 
     if fmt in ("svg", "pdf", "docx") and not tools:
         tools = run_optional_tools(path)
@@ -847,20 +1010,29 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         tools=tools,
         details=details,
         notes=notes,
+        layer_a_total=layer_a_total,
+        layer_a_hits=layer_a_hits,
     )
 
 
 def clean_container(
     path: Path,
     dest: Path,
+    fmt: str | None = None,
     *,
     also_layer_a_text: bool = True,
 ) -> dict[str, Any]:
-    """Clean container metadata; optionally Layer-A scrub text bodies for md/html."""
+    """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
+
+    ``fmt`` pins the container format when the caller already knows it. This
+    matters for ``--in-place`` flows where *path* is a ``.bak`` copy whose
+    suffix would otherwise make markdown/HTML (which have no magic bytes)
+    classify as ``unknown``.
+    """
     from text_unicode import clean_text  # local import to avoid cycles
 
     data = path.read_bytes()
-    fmt = detect_container_format(path, data)
+    fmt = fmt or detect_container_format(path, data)
     actions: list[str] = []
     dest.parent.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {"format": fmt}
@@ -872,10 +1044,10 @@ def clean_container(
         actions, meta_extra = clean_pdf(path, dest)
         meta.update(meta_extra)
     elif fmt == "docx":
-        cleaned, actions = clean_docx(data)
+        cleaned, actions = clean_docx(data, also_layer_a_text=also_layer_a_text)
         safe_write_bytes(dest, cleaned)
     elif fmt == "odt":
-        cleaned, actions = clean_odt(data)
+        cleaned, actions = clean_odt(data, also_layer_a_text=also_layer_a_text)
         safe_write_bytes(dest, cleaned)
     elif fmt == "html":
         text = data.decode("utf-8", errors="surrogateescape")

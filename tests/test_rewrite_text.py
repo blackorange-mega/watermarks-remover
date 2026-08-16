@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.server
+import json
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
+SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import rewrite_text  # noqa: E402
@@ -164,6 +165,46 @@ def test_flag_env(monkeypatch):
     assert _flag_env("WATERMARKS_REWRITE_ALLOW_REMOTE")
     monkeypatch.setenv("WATERMARKS_REWRITE_ALLOW_REMOTE", "0")
     assert not _flag_env("WATERMARKS_REWRITE_ALLOW_REMOTE")
+
+
+def test_openai_compatible_sends_reasoning_effort_when_set():
+    captured = {}
+
+    class Collector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices": [{"message": {"content": "rewritten"}}]}')
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        result, _ = rewrite(
+            "hello",
+            **_rewrite_http_kwargs(
+                f"http://127.0.0.1:{server.server_address[1]}",
+                reasoning_effort="none",
+            ),
+        )
+        assert result == "rewritten"
+        assert captured["body"]["reasoning_effort"] == "none"
+
+        captured.clear()
+        rewrite(
+            "hello",
+            **_rewrite_http_kwargs(
+                f"http://127.0.0.1:{server.server_address[1]}",
+                reasoning_effort=None,
+            ),
+        )
+        assert "reasoning_effort" not in captured["body"]
+    finally:
+        server.shutdown()
 
 
 def test_rewrite_denies_remote_host_without_opt_in():

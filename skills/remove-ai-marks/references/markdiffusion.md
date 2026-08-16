@@ -51,7 +51,7 @@ Apache-2.0. Installed from PyPI at a pinned version
 ## Harness usage
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 MD="$HOME/markdiffusion/.venv/bin/python"
 
 "$SCRIPTS/setup_markdiffusion.sh"                     # PyPI pin default

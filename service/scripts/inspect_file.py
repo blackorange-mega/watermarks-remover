@@ -94,7 +94,11 @@ def main() -> int:
         print(f"AI metadata: {report.has_ai_metadata}")
         for f in report.findings:
             print(f"  - [{classify_finding_confidence(f)}] {f}")
-    return 0 if not (report.has_c2pa or report.has_ai_metadata) else 1
+    # layer_a_total counts body-text carriers that clean will strip; the text
+    # branch above already exits non-zero for those, so containers match.
+    if report.has_c2pa or report.has_ai_metadata or report.layer_a_total:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

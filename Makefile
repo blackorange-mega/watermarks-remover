@@ -2,9 +2,10 @@
 	smoke-ctrlregen bootstrap-ctrlregen docker-ctrlregen-build docker-ctrlregen-help \
 	smoke-markllm bootstrap-markllm docker-markllm-build docker-markllm-help \
 	smoke-markdiffusion bootstrap-markdiffusion docker-markdiffusion-build docker-markdiffusion-help \
-	install-skill clean
+	docker-core-build docker-core-help serve compose-up compose-up-heavy compose-check \
+	install-skill install-cursor-text-skill clean
 
-SCRIPTS := skills/remove-ai-marks/scripts
+SCRIPTS := service/scripts
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 
 test:
@@ -28,10 +29,10 @@ smoke-synthid:
 	fi
 
 bootstrap-synthid:
-	./skills/remove-ai-marks/scripts/setup_synthid.sh
+	./service/scripts/setup_synthid.sh
 
 docker-synthid-build:
-	docker build -f Dockerfile.synthid -t watermarks-remover-synthid-scorer .
+	docker build -f service/Dockerfile.synthid -t watermarks-remover-synthid-scorer service/
 
 docker-synthid-help:
 	docker run --rm watermarks-remover-synthid-scorer --help
@@ -44,10 +45,10 @@ smoke-ctrlregen:
 	fi
 
 bootstrap-ctrlregen:
-	./skills/remove-ai-marks/scripts/setup_ctrlregen.sh
+	./service/scripts/setup_ctrlregen.sh
 
 docker-ctrlregen-build:
-	docker build -f Dockerfile.ctrlregen -t watermarks-remover-ctrlregen .
+	docker build -f service/Dockerfile.ctrlregen -t watermarks-remover-ctrlregen service/
 
 docker-ctrlregen-help:
 	docker run --rm watermarks-remover-ctrlregen --help
@@ -60,10 +61,10 @@ smoke-markllm:
 	fi
 
 bootstrap-markllm:
-	./skills/remove-ai-marks/scripts/setup_markllm.sh
+	./service/scripts/setup_markllm.sh
 
 docker-markllm-build:
-	docker build -f Dockerfile.markllm -t watermarks-remover-markllm .
+	docker build -f service/Dockerfile.markllm -t watermarks-remover-markllm service/
 
 docker-markllm-help:
 	docker run --rm watermarks-remover-markllm --help
@@ -76,18 +77,41 @@ smoke-markdiffusion:
 	fi
 
 bootstrap-markdiffusion:
-	./skills/remove-ai-marks/scripts/setup_markdiffusion.sh
+	./service/scripts/setup_markdiffusion.sh
 
 docker-markdiffusion-build:
-	docker build -f Dockerfile.markdiffusion -t watermarks-remover-markdiffusion .
+	docker build -f service/Dockerfile.markdiffusion -t watermarks-remover-markdiffusion service/
 
 docker-markdiffusion-help:
 	docker run --rm watermarks-remover-markdiffusion --help
+
+# Core HTTP service (text + file/image metadata cleaning).
+docker-core-build:
+	docker build -f service/Dockerfile -t watermarks-remover service/
+
+docker-core-help:
+	docker run --rm watermarks-remover /app/scripts/server.py --help
+
+# Run the HTTP service locally (stdlib only, no Docker).
+serve:
+	$(PYTHON) $(SCRIPTS)/server.py --host 127.0.0.1 --port 8765
+
+compose-up:
+	docker compose up --build -d
+
+compose-up-heavy:
+	docker compose --profile harness --profile heavy up --build -d
+
+compose-check:
+	./compose-check.sh
 
 install-skill:
 	mkdir -p $(HOME)/.grok/skills
 	ln -sfn $(CURDIR)/skills/remove-ai-marks $(HOME)/.grok/skills/remove-ai-marks
 	@echo "linked -> $(HOME)/.grok/skills/remove-ai-marks"
+
+install-cursor-text-skill:
+	$(PYTHON) install_skill.py
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

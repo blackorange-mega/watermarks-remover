@@ -13,6 +13,7 @@ from common import CONFIDENCE_LEVELS, classify_finding_confidence
 from container_meta import inspect_container
 from format_dispatch import classify
 from image_meta import inspect_image
+from score_stylometry import score_text_stylometry
 from text_unicode import inspect_text
 
 
@@ -32,7 +33,11 @@ def text_findings(report: Any) -> tuple[list[str], list[str], int]:
     return findings, confidences, report.suspicious_total
 
 
-def scan_file(path: Path, display_name: str | None = None) -> dict[str, Any]:
+def scan_file(
+    path: Path,
+    display_name: str | None = None,
+    check_stylometry: bool = False,
+) -> dict[str, Any]:
     """Inspect one local file and return a normalized audit item."""
     name = display_name or str(path)
     kind = classify(path)
@@ -44,7 +49,7 @@ def scan_file(path: Path, display_name: str | None = None) -> dict[str, Any]:
             return {"path": name, "kind": "text", "error": str(e)}
         report = inspect_text(text)
         findings, confidences, suspicious = text_findings(report)
-        return {
+        item: dict[str, Any] = {
             "path": name,
             "kind": "text",
             "has_c2pa": False,
@@ -54,6 +59,14 @@ def scan_file(path: Path, display_name: str | None = None) -> dict[str, Any]:
             "confidence": confidences,
             "notes": report.notes,
         }
+        if check_stylometry and text:
+            s_rep = score_text_stylometry(text, path=name)
+            item["stylometry"] = s_rep.to_dict()
+            if s_rep.score >= 0.65:
+                item["findings"].append(f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})")
+                item["confidence"].append("probable")
+                item["suspicious_total"] += 1
+        return item
 
     if kind == "image":
         report = inspect_image(path)
@@ -71,23 +84,25 @@ def scan_file(path: Path, display_name: str | None = None) -> dict[str, Any]:
     report = inspect_container(path)
     findings = list(report.findings)
     confidences = [classify_finding_confidence(f) for f in report.findings]
-    suspicious = 0
+    # Layer A body-scan findings (and count) already come from
+    # inspect_container() for markdown/html; it mirrors clean_container().
+    suspicious = report.layer_a_total
+    stylometry_dict = None
 
-    # Text-bearing containers also get a Layer A scan of their visible text,
-    # mirroring the skill's "container + Layer A" workflow.
-    if report.format in ("html", "markdown"):
+    if check_stylometry and report.format in ("html", "markdown"):
         try:
             text = path.read_text(encoding="utf-8", errors="surrogateescape")
         except OSError:
             text = ""
         if text:
-            t_report = inspect_text(text)
-            t_findings, t_confidences, t_suspicious = text_findings(t_report)
-            findings.extend(t_findings)
-            confidences.extend(t_confidences)
-            suspicious = t_suspicious
+            s_rep = score_text_stylometry(text, path=name)
+            stylometry_dict = s_rep.to_dict()
+            if s_rep.score >= 0.65:
+                findings.append(f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})")
+                confidences.append("probable")
+                suspicious += 1
 
-    return {
+    item = {
         "path": name,
         "kind": report.format,
         "has_c2pa": report.has_c2pa,
@@ -97,6 +112,9 @@ def scan_file(path: Path, display_name: str | None = None) -> dict[str, Any]:
         "confidence": confidences,
         "notes": report.notes,
     }
+    if stylometry_dict:
+        item["stylometry"] = stylometry_dict
+    return item
 
 
 def is_actionable(item: dict[str, Any]) -> bool:

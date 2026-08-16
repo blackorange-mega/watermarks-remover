@@ -2,3 +2,4 @@
 # Dependabot can bump these; keep them in sync with the local .venv.
 pytest==9.1.1
 pip-audit==2.10.1
+openapi-spec-validator==0.9.0

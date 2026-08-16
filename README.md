@@ -13,7 +13,7 @@ _ _ _ ____ ___ ____ ____ _  _ ____ ____ _  _ ____    ____ ____ _  _ ____ _  _ __
 [![Stars](https://img.shields.io/github/stars/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/stargazers)
 [![Forks](https://img.shields.io/github/forks/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/forks)
 
-Agent skill + stdlib Python scripts to strip **multi-vendor AI provenance marks** from text and files — for privacy and hygiene on content **you own**.
+Agent skill + stdlib Python service to strip **multi-vendor AI provenance marks** from text and files — for privacy and hygiene on content **you own**. The skill is a thin client: it drives the machinery over HTTP, so the agent host needs no Python.
 
 | Layer | Target | How |
 | --- | --- | --- |
@@ -23,9 +23,10 @@ Agent skill + stdlib Python scripts to strip **multi-vendor AI provenance marks*
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style marks.
 
-**Latest release:** [v0.4.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.4.0)
+**Latest release:** [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0)
 
 Skill path: [`skills/remove-ai-marks/`](skills/remove-ai-marks/)  
+Service path: [`service/`](service/)  
 (migration: formerly `remove-claude-marks`; slash alias `/remove-claude-marks` still documented)
 
 ## Desktop app (no terminal needed)
@@ -43,6 +44,8 @@ Details: [`gui/README.md`](gui/README.md)
 
 ## Install (agent skill)
 
+The skill ships **no code** — it calls the service over HTTP. Install the skill (markdown only) and start the service, then set `WATERMARKS_SERVICE_URL` if it is not `http://127.0.0.1:8765`.
+
 ```bash
 # Grok Build / project-local
 mkdir -p .grok/skills
@@ -55,7 +58,49 @@ ln -sfn "$(pwd)/skills/remove-ai-marks" ~/.grok/skills/remove-ai-marks
 
 Invoke with `/remove-ai-marks` or ask to “strip AI watermarks / C2PA / Claude marks / SynthID-class text.”
 
-Optional system tools (auto-used when present):
+### Optional Cursor text-only skill
+
+[`skills/clean-user-facing-text/`](skills/clean-user-facing-text/) is a
+self-contained Cursor skill for authorized manuscripts, documentation, and web
+copy. It excludes image, C2PA, service, and external-model tooling.
+
+Install it into `~/.cursor/skills/clean-user-facing-text`:
+
+```bash
+python3 install_skill.py
+```
+
+On Windows, use `py install_skill.py`. The `install-skill.sh` wrapper is
+provided for macOS/Linux shells. Existing installations are preserved unless
+you pass `--force`; replacement is staged first and the previous install is
+kept as a uniquely named backup.
+
+Skill invocation is model-selected. Projects that explicitly adopt this
+workflow can also copy the optional rule:
+
+```bash
+mkdir -p /path/to/project/.cursor/rules
+cp integrations/cursor/clean-user-facing-text.mdc \
+  /path/to/project/.cursor/rules/clean-user-facing-text.mdc
+```
+
+For all projects, put the same instruction in Cursor **User Rules** instead.
+Rules improve consistency but remain model instructions; Cursor does not expose
+a deterministic pre-send filter for final chat responses.
+
+### Start the service
+
+The fastest path is a local HTTP server (Python 3.10+ stdlib only — no deps, no Docker):
+
+```bash
+make serve                 # http://127.0.0.1:8765
+# or directly:
+python3 service/scripts/server.py --host 127.0.0.1 --port 8765
+```
+
+For the whole infra (core + optional harness/heavy backends), see [Docker / compose](#docker--compose) below.
+
+Optional system tools (auto-used when present — preinstalled in the core Docker image):
 
 | Tool | Role |
 | --- | --- |
@@ -68,7 +113,7 @@ Core scripts need **Python 3.10+** stdlib only. Layer B model calls are optional
 ## Quick use (scripts)
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 
 # Unified inspect / clean
 python3 "$SCRIPTS/inspect_file.py" draft.md
@@ -111,6 +156,108 @@ python3 "$SCRIPTS/inspect_text.py" report.docx
 Detection is by magic number plus a control-byte ratio, so text in encodings
 other than UTF-8 keeps working. `--force-text` overrides it everywhere.
 
+## HTTP service
+
+The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) — the interface the skill uses and the way any web app can integrate without vendoring:
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/health` | — | `{"ok": true, "version": ...}` |
+| GET | `/capabilities` | — | optional tools / backends present |
+| GET | `/openapi.json` | — | dynamically generated OpenAPI 3.0.3 spec |
+| POST | `/inspect` | `{"file": "<base64>", "name": "notes.md"}` | `{"ok", "kind", "suspicious", "report"}` |
+| POST | `/clean` | `{"file": "<base64>", "name": "notes.md", "options": {...}}` | `{"ok", "kind", "cleaned": "<base64>", "report"}` |
+
+```bash
+WM="http://127.0.0.1:8765"
+curl -s "$WM/health"                       # {"ok": true, "version": "..."}
+curl -s "$WM/openapi.json"                 # machine-readable OpenAPI 3.0.3 contract
+curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
+  -d "{\"file\": \"$(base64 -w0 notes.md)\", \"name\": \"notes.md\"}"
+```
+
+The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request. Loopback-only bind by default (`--host` to override); intended for a trusted network.
+
+## Docker / compose
+
+Published images (GHCR):
+
+| Image tag | Contents | Published? |
+| --- | --- | --- |
+| `ghcr.io/guillaumemeyer/watermarks-remover:<tag>` / `:latest` | Core HTTP service + all cleaners + exiftool / qpdf / c2patool | Yes |
+| `…:markllm-<tag>` / `:markllm-latest` | MarkLLM text-watermark harness (Apache-2.0 upstream) | Yes |
+| `…:markdiffusion-<tag>` / `:markdiffusion-latest` | MarkDiffusion image harness (Apache-2.0 upstream) | Yes |
+| `watermarks-remover-ctrlregen:local` | CtrlRegen pixel removal — **never published** (`noai-watermark` ships no LICENSE) | Local build only |
+| `watermarks-remover-synthid-scorer:local` | reverse-SynthID scorer — **never published** (non-commercial Research License) | Local build only |
+
+Build and run the core service:
+
+```bash
+make docker-core-build
+docker run --rm -p 127.0.0.1:8765:8765 --read-only --tmpfs /tmp watermarks-remover
+# any CLI stays runnable by overriding the command:
+docker run --rm -v "$(pwd):/data" watermarks-remover \
+  /app/scripts/clean_file.py /data/notes.md -o /data/notes.cleaned.md
+```
+
+Whole-infra bring-up:
+
+```bash
+docker compose up -d                         # core HTTP service only
+docker compose --profile harness up -d       # + markllm / markdiffusion
+docker compose --profile heavy up -d         # + ctrlregen / synthid (local builds)
+docker compose --profile harness --profile heavy up -d   # all services
+```
+
+The compose stack maps the core service to `127.0.0.1:8765`. The harness/heavy services are one-shot CLIs — invoke with `docker compose run --rm <service> …` when you need verification or pixel work.
+
+Validate the running stack (exit code only, no output on success):
+
+```bash
+make compose-check        # or: ./compose-check.sh
+```
+
+Checks `wr-core` via `GET /health` and runs each harness/heavy service with `--help`, requiring exit `0`.
+
+### Configuration (env vars for docker compose)
+
+**Nothing is required to clean arbitrary text** — the core service works out of the box:
+
+```bash
+echo "Hello\u200bWorld\u00ad!" > /tmp/sample.txt
+curl -s -X POST http://127.0.0.1:8765/clean -H 'Content-Type: application/json' \
+  -d "{\"file\": \"$(base64 -w0 /tmp/sample.txt)\", \"name\": \"sample.txt\"}"
+```
+
+Everything else is optional and lives in a `.env` file at the repo root. `docker compose` **auto-loads `.env`** and interpolates the `${VAR}` references in `compose.yaml` from it (shell exports win over `.env` if both are set).
+
+```bash
+cp .env.example .env       # then edit
+docker compose up -d       # picks up .env automatically
+```
+
+`.env` is **gitignored** (deny-by-default) — never commit it. For host-side CLI runs (`rewrite_text.py`, the skill), export the same file into the environment:
+
+```bash
+set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o /tmp/x.rewritten.txt
+```
+
+| Var | Reaches | Purpose |
+| --- | --- | --- |
+| `WATERMARKS_SERVER_API_KEY` | `wr-core` (via compose `environment`) | Require `Authorization: Bearer <key>` on the HTTP API |
+| `HF_TOKEN` | harness/heavy services | Hugging Face token for gated models |
+| `WATERMARKS_SERVICE_URL` | client only (skill / curl) | Where to reach the service; default `http://127.0.0.1:8765` |
+| `WATERMARKS_REWRITE_BACKEND` | `rewrite_text.py` hook | `print-prompt` (default) / `ollama` / `openai-compatible` |
+| `WATERMARKS_REWRITE_MODEL` | `rewrite_text.py` hook | Model name (e.g. `deepseek-v4-flash`) |
+| `WATERMARKS_REWRITE_BASE_URL` | `rewrite_text.py` hook | API base (e.g. `https://api.deepseek.com`) |
+| `WATERMARKS_REWRITE_API_KEY` | `rewrite_text.py` hook | API key — env only, never on argv |
+| `WATERMARKS_REWRITE_ALLOW_REMOTE` | `rewrite_text.py` hook | `1` to allow non-loopback endpoints |
+| `WATERMARKS_REWRITE_REASONING_EFFORT` | `rewrite_text.py` hook | `none` (default) / `low` / `medium` / `high` / `off` |
+
+Layer B is agent-orchestrated in the skill (it rewrites with its own model), so the `WATERMARKS_REWRITE_*` vars are only needed when driving `rewrite_text.py` directly.
+
+Images publish automatically on `v*` tags via [`.github/workflows/release-images.yml`](.github/workflows/release-images.yml).
+
 ## Optional SynthID pixel scoring
 
 `inspect_image.py` and `clean_image.py` can report a pixel-domain SynthID
@@ -123,7 +270,7 @@ Research License.
 ### Option 1: one-command bootstrap (no Docker)
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 
 # Clones upstream, creates a venv, and installs scorer-only dependencies.
 "$SCRIPTS/setup_synthid.sh"
@@ -180,7 +327,7 @@ all-rights-reserved: it is cloned at a pinned commit and loaded at runtime.
 ### Bootstrap
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 
 # Clones upstream (pinned commit), creates a venv, installs torch + deps.
 "$SCRIPTS/setup_ctrlregen.sh"
@@ -270,7 +417,7 @@ scoring model (default `facebook/opt-1.3b`, Apache-2.0) downloads from Hugging
 Face on first run.
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 
 # Bootstrap (clones upstream, creates ~/MarkLLM/.venv, installs deps).
 "$SCRIPTS/setup_markllm.sh"
@@ -351,7 +498,7 @@ commit instead. The Stable Diffusion model (default
 `huanzi05/stable-diffusion-2-1-base`) downloads from Hugging Face on first run.
 
 ```bash
-SCRIPTS=skills/remove-ai-marks/scripts
+SCRIPTS=service/scripts
 
 # Bootstrap (PyPI pin default; creates ~/markdiffusion/.venv, installs deps).
 "$SCRIPTS/setup_markdiffusion.sh"
@@ -513,6 +660,18 @@ See [`skills/remove-ai-marks/references/ethics.md`](skills/remove-ai-marks/refer
 
 **Responsible use:** This project is for content you own or are authorized to process. Users must adhere to local regulations and use it responsibly. The developers disclaim any liability for potential misuse by users.
 
+## Ecosystem
+
+Third-party projects that wrap or complement this repository, listed for discoverability only. **They are not maintained, endorsed, or supported by this project.** This project does not review their code, vouch for their behavior or guarantees, or take responsibility for anything you install or run from this list. Each project is governed by its own license, maintainers, and documentation — read those before using it.
+
+### MetaClean — desktop GUI
+
+[MetaClean](https://github.com/Moresyl/metaclean) is an independent MIT-licensed Rust/Tauri desktop application (Windows, macOS, Linux) providing a packaged native GUI for drag-and-drop metadata cleaning, with a system tray and Explorer integration. It is a separate codebase: it does not call this repository's Python service, and its supported formats and cleaning guarantees differ from this project's. See its README for details.
+
+### Adding a project
+
+To register a project here, open a PR adding a short entry — project name, what it wraps or adds, and a link to its own repository. Keep entries brief and factual; do not claim compatibility with, or endorsement by, this project.
+
 ## Tests
 
 ```bash
@@ -525,18 +684,57 @@ make smoke                          # quick CLI smoke on fixtures
 
 ### Unreleased
 
-- New optional MarkDiffusion image-watermark harness (external `THU-BPM/MarkDiffusion`, Apache-2.0): `markdiffusion_harness.py` with `watermark` / `detect` / `purify` subcommands for nine image schemes (Tree-Ring, Ring-ID, ROBIN, WIND, SFW, Gaussian-Shading, GaussMarker, PRC, SEAL)
+- **Fix `inspect` missing Layer A carriers in markdown/HTML**: `inspect_container` never scanned the document body, so a `.md` or `.html` file holding invisible Unicode came back `suspicious: false` while `clean_container` went on to strip it — the same bytes saved as `.txt` were correctly flagged. The scan now runs for exactly the formats `clean_container` scrubs, so inspect predicts clean. Container reports gain `suspicious_total` (the same key `TextInspectReport` uses, so the HTTP `suspicious` flag and the `inspect_file` exit code pick it up) and `layer_a_hits`
+
+### [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0) — service & Docker distribution, HTTP API, and verification harnesses
+
+**Service / Docker distribution**
+
+- **Skill/service split**: the skill (`skills/remove-ai-marks/`) is now a code-free remote client over HTTP; all implementation moved to `service/scripts/` and runs behind `server.py`, a stdlib HTTP entrypoint (`/health`, `/inspect`, `/clean`, `/capabilities`)
+- **HTTP service**: `service/scripts/server.py` exposes the cleaning pipeline over JSON/base64; hardening mirrors the CLIs (size caps, binary guard, atomic writes, loopback default, optional `WATERMARKS_SERVER_API_KEY` bearer auth)
+- **OpenAPI**: `GET /openapi.json` serves a dynamically generated OpenAPI 3.0.3 spec (built from the route table + live config, so it never drifts from the real endpoints); CI validates it with `openapi-spec-validator`
+- **Core Docker image** (`service/Dockerfile`): full cleaning service with exiftool / qpdf / c2patool preinstalled; any CLI stays runnable by overriding the command
+- **Docker / compose**: `compose.yaml` brings up the whole infra (`core` always; `markllm` / `markdiffusion` behind `profile: harness`; `ctrlregen` / `synthid` behind `profile: heavy` as local-only builds); services are prefixed `wr-`; harness/heavy services default to `command: ["--help"]` so `docker compose up --profile harness --profile heavy` exits cleanly (one-shot CLIs are run with `docker compose run`); new `make compose-check` / `compose-check.sh` validates the running stack (exit code only)
+- **GHCR publishing**: `.github/workflows/release-images.yml` publishes `core`, `markllm`, `markdiffusion` images on `v*` tags; `ctrlregen` / `synthid` are never published (upstream licensing)
+- **Env configuration**: `.env.example` + service configuration guide; `docker compose` auto-loads `.env`; `.env` is gitignored (deny-by-default)
+- **Repo hygiene**: `.gitignore` and `service/.dockerignore` are now deny-by-default — only explicitly allowed paths can be committed or sent in a build context (image contexts only ship `service/scripts/`, which is all the Dockerfiles COPY)
+- Tests: `tests/test_http_server.py` (13 cases) for the HTTP service; all suites re-pointed at `service/scripts/`
+
+**MarkDiffusion image-watermark harness (optional)**
+
+- New optional harness (external `THU-BPM/MarkDiffusion`, Apache-2.0): `markdiffusion_harness.py` with `watermark` / `detect` / `purify` subcommands for nine image schemes (Tree-Ring, Ring-ID, ROBIN, WIND, SFW, Gaussian-Shading, GaussMarker, PRC, SEAL)
 - `clean_image.py --remove-pixel diffusion` runs the MarkDiffusion `DiffusionPurification` regeneration attack as an alternative pixel-removal engine (conservative strength 0.3 default)
 - `setup_markdiffusion.sh` bootstrap (PyPI pin `1.0.2`; `--checkout` editable clone at pinned commit) + `requirements-markdiffusion.txt` + `Dockerfile.markdiffusion` and Makefile `bootstrap-markdiffusion` / `smoke-markdiffusion` / `docker-markdiffusion-build` / `docker-markdiffusion-help`
 - Mock-based tests (`tests/test_markdiffusion_harness.py`) — no torch in CI; `references/markdiffusion.md` reference doc
 - Docs: same-scheme-only verification caveat (not a vendor-detector oracle) and blind-regeneration drift caveat in README, SKILL.md, `removal-matrix.md`, `markdiffusion.md`
-- Add stdlib-only WebP inspection and metadata cleaning for RIFF `C2PA`, XMP, EXIF, and ICC profile chunks
-- New optional MarkLLM harness (external `THU-BPM/MarkLLM` checkout, Apache-2.0): `detect_text_watermark.py` with `detect` / `watermark` subcommands for KGW and SynthID schemes
+
+**MarkLLM text-watermark harness (optional)**
+
+- New optional harness (external `THU-BPM/MarkLLM` checkout, Apache-2.0): `detect_text_watermark.py` with `detect` / `watermark` subcommands for KGW and SynthID schemes
 - `rewrite_text.py --markllm-scheme` runs before/after detection around a Layer B rewrite (env-gated; reports `cleared`)
 - `setup_markllm.sh` bootstrap + `requirements-markllm.txt` (pinned deps) + `Dockerfile.markllm` and Makefile `bootstrap-markllm` / `smoke-markllm` / `docker-markllm-build` / `docker-markllm-help`
-- Mock-based tests (`tests/test_markllm_detect.py`, 21 cases) — no torch in CI
-- Docs: verification-harness caveat (same-config-only, not a vendor-detector oracle) in README, SKILL.md, `removal-matrix.md`, `vendor-notes.md`
 - Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, optional `WATERMARKS_MARKLLM_RLIMIT_AS` on the rewrite subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
+- Mock-based tests (`tests/test_markllm_detect.py`, 21 cases) — no torch in CI; verification-harness caveat (same-config-only, not a vendor-detector oracle) documented in README, SKILL.md, `removal-matrix.md`, `vendor-notes.md`
+
+**Fixes and polish**
+
+- **Layer B**: `rewrite_text.py` now sends `reasoning_effort: "none"` by default for `openai-compatible` backends (`--reasoning-effort` / `WATERMARKS_REWRITE_REASONING_EFFORT`; `off` omits it). Reasoning models like `deepseek-v4-flash` otherwise burn ~100s of chain-of-thought on a one-line rewrite (9,894 vs 12 completion tokens)
+- **Fix markllm image build**: `requirements-markllm.txt` pinned `tokenizers==0.23.1`, which conflicts with `transformers==5.15.0` (caps `tokenizers<=0.23.0`; no 0.23.0 release exists) — now pinned `tokenizers==0.22.2`; torch moved to the CPU wheel index (`torch==2.13.0.*`) so the image is CPU-only like `Dockerfile.markdiffusion`
+- **Fix ctrlregen image build**: the 2023-era research pins (`safetensors==0.4.3`, `transformers==4.37.2` → `tokenizers<0.19`) ship no Python 3.14 wheels, so the base image is now `python:3.11-slim` (digest-pinned, multi-arch)
+- **Fix harness images at runtime**: `Dockerfile.markllm` and `Dockerfile.markdiffusion` never copied `common.py` into `/app` (pre-existing bug) — added
+- **WebP**: stdlib-only inspection and metadata cleaning for RIFF `C2PA`, XMP, EXIF, and ICC profile chunks (#37)
+- **Filename sanitization**: HTTP service refuses unsafe client-supplied output names
+- **Fix markdown frontmatter cleaner** crashing on and leaking nested AI keys (#25)
+- **Text tools refuse binary input**; `--force-text` overrides (#24)
+- **`--json` no longer suppresses the residual-signal exit code** (#30)
+- **`inspect_file` prints the filename** in its output (#50)
+- **Preserve mixed-case CMS generator meta tags** (#42)
+- **Preserve load-bearing script invisibles, strip PUA** in Layer A (#38, #52)
+- **Preserve script joiners, flag emoji, and Arabic Cf marks** in Layer A (#28)
+- **Harden website audit against SSRF and gzip bombs** (#49)
+- **SECURITY.md** only references the private advisories channel (#51)
+- **Windows**: PowerShell ports of the setup bootstraps (#40)
+- **Docs**: add stars/forks shields and drop star-history chart; add MarkLLM to README references; pull request template; plan for Docker CLI + API deployment
 
 ### [v0.4.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.4.0) — pixel removal, finding confidence, Windows & false-positive fixes
 

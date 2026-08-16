@@ -63,7 +63,7 @@ done
 
 DIR="${DIR:-$DEFAULT_DIR}"
 mkdir -p "$(dirname "$DIR")"
-if command -v realpath >/dev/null 2>&1; then
+if realpath -m . >/dev/null 2>&1; then  # BSD/macOS realpath has no -m
   DIR="$(realpath -m "$DIR")"
 else
   DIR="$(cd "$(dirname "$DIR")" && pwd)/$(basename "$DIR")"
@@ -117,5 +117,5 @@ cat <<EOF
 Done. Score an image with:
 
   export REVERSE_SYNTHID_DIR="$DIR"
-  "$DIR/.venv/bin/python" "\$REPO/skills/remove-ai-marks/scripts/score_synthid.py" IMAGE
+  "$DIR/.venv/bin/python" "\$REPO/service/scripts/score_synthid.py" IMAGE
 EOF

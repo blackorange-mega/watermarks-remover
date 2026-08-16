@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills" / "remove-ai-marks" / "scripts"
+SCRIPTS = ROOT / "service" / "scripts"
 INSPECT = SCRIPTS / "inspect_file.py"
 FIXTURE = ROOT / "tests" / "fixtures" / "sample_watermarked.txt"
 

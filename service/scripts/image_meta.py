@@ -110,6 +110,20 @@ def detect_format(data: bytes) -> str:
         return "jpeg"
     if len(data) >= 12 and data[:4] == WEBP_RIFF and data[8:12] == WEBP_SIG:
         return "webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        box_size = struct.unpack(">I", data[0:4])[0]
+        header_chunk = (
+            data[8:min(box_size, len(data), 64)]
+            if box_size >= 8
+            else data[8:min(len(data), 64)]
+        )
+        if any(b in header_chunk for b in (b"avif", b"avis", b"avio")):
+            return "avif"
+        if any(
+            b in header_chunk
+            for b in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1", b"heif")
+        ):
+            return "heic"
     return "unknown"
 
 
@@ -276,6 +290,130 @@ def inspect_webp(data: bytes) -> tuple[bool, bool, list[str]]:
                 ):
                     has_c2pa = True
                 findings.append(f"WebP {name}: {', '.join(hits[:8])}")
+    return has_c2pa, has_ai or has_c2pa, findings
+
+
+XMP_UUID = b"\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac"
+
+
+def _parse_isobmff_boxes(
+    data: bytes, start: int = 0, end: int | None = None
+) -> list[tuple[bytes, bytes, int, int]]:
+    """Parse top-level or container ISOBMFF boxes.
+
+    Returns list of (fourcc, payload, total_box_size, header_size).
+    """
+    if end is None:
+        end = len(data)
+    boxes = []
+    pos = start
+    while pos + 8 <= end:
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        fourcc = data[pos + 4 : pos + 8]
+        header_size = 8
+        if size == 1:
+            if pos + 16 > end:
+                break
+            size = struct.unpack(">Q", data[pos + 8 : pos + 16])[0]
+            header_size = 16
+        elif size == 0:
+            size = end - pos
+
+        if size < header_size or pos + size > end:
+            break
+        payload = data[pos + header_size : pos + size]
+        boxes.append((fourcc, payload, size, header_size))
+        pos += size
+    return boxes
+
+
+def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[str]]:
+    findings: list[str] = []
+    has_c2pa = False
+    has_ai = False
+
+    boxes = _parse_isobmff_boxes(data)
+    if not boxes:
+        return False, False, [f"not a valid {fmt.upper()} (no ISOBMFF boxes found)"]
+
+    for fourcc, payload, _, _ in boxes:
+        name = fourcc.decode("latin-1", errors="replace")
+        if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
+            has_c2pa = True
+            findings.append(f"{fmt.upper()} top-level box {name} (C2PA/JUMBF manifest)")
+        elif fourcc == b"uuid":
+            if payload.startswith(XMP_UUID):
+                has_ai = True
+                xmp_text = payload[16:]
+                hits = _contains_any(xmp_text, AI_META_HINTS + C2PA_MARKERS)
+                if hits:
+                    findings.append(f"{fmt.upper()} XMP uuid box: {', '.join(hits[:8])}")
+                else:
+                    findings.append(f"{fmt.upper()} XMP uuid box")
+                if any(
+                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth")
+                    for h in hits
+                ):
+                    has_c2pa = True
+            else:
+                hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+                if hits:
+                    has_ai = True
+                    findings.append(f"{fmt.upper()} uuid box: {', '.join(hits[:8])}")
+                    if any(
+                        h.lower() in ("c2pa", "contentcredentials", "jumb")
+                        for h in hits
+                    ):
+                        has_c2pa = True
+        elif fourcc == b"meta":
+            meta_sub = _parse_isobmff_boxes(payload, start=4)
+            for s_fourcc, s_payload, _, _ in meta_sub:
+                s_name = s_fourcc.decode("latin-1", errors="replace")
+                if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
+                    has_c2pa = True
+                    findings.append(
+                        f"{fmt.upper()} meta sub-box {s_name} (C2PA/JUMBF container)"
+                    )
+                elif s_fourcc == b"uuid":
+                    if s_payload.startswith(XMP_UUID):
+                        has_ai = True
+                        hits = _contains_any(
+                            s_payload[16:], AI_META_HINTS + C2PA_MARKERS
+                        )
+                        if hits:
+                            findings.append(
+                                f"{fmt.upper()} meta XMP uuid: {', '.join(hits[:8])}"
+                            )
+                        else:
+                            findings.append(f"{fmt.upper()} meta XMP uuid box")
+                        if any(
+                            h.lower() in ("c2pa", "contentcredentials", "jumb")
+                            for h in hits
+                        ):
+                            has_c2pa = True
+                    else:
+                        hits = _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS)
+                        if hits:
+                            has_ai = True
+                            findings.append(f"{fmt.upper()} meta uuid: {', '.join(hits[:8])}")
+                elif s_fourcc in (b"iinf", b"infe", b"iref", b"iloc", b"xml ", b"bxml"):
+                    hits = _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS)
+                    if hits:
+                        has_ai = True
+                        if any(
+                            h.lower() in ("c2pa", "contentcredentials", "jumb")
+                            for h in hits
+                        ):
+                            has_c2pa = True
+                        findings.append(
+                            f"{fmt.upper()} meta/{s_name}: {', '.join(hits[:8])}"
+                        )
+
+    whole = _contains_any(data, C2PA_MARKERS)
+    if whole and not has_c2pa:
+        has_c2pa = True
+        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+
     return has_c2pa, has_ai or has_c2pa, findings
 
 
@@ -576,12 +714,16 @@ def inspect_image(
         has_c2pa, has_ai, findings = inspect_jpeg(data)
     elif fmt == "webp":
         has_c2pa, has_ai, findings = inspect_webp(data)
+    elif fmt in ("avif", "heic"):
+        has_c2pa, has_ai, findings = inspect_isobmff(data, fmt)
     else:
-        has_c2pa, has_ai, findings = False, False, ["unsupported format (PNG/JPEG/WebP)"]
+        has_c2pa, has_ai, findings = False, False, [
+            "unsupported format (PNG/JPEG/WebP/AVIF/HEIC)"
+        ]
 
     notes: list[str] = []
     if fmt == "unknown":
-        notes.append("format not fully inspected; only PNG/JPEG are supported")
+        notes.append("format not fully inspected; only PNG/JPEG/WebP/AVIF/HEIC are supported")
 
     tools = run_optional_tools(path)
     # Elevate flags from tools
@@ -781,6 +923,74 @@ def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     return WEBP_RIFF + struct.pack("<I", len(body)) + bytes(body), actions
 
 
+def strip_isobmff(
+    data: bytes, fmt: str = "avif", *, strip_all_metadata: bool = True
+) -> tuple[bytes, list[str]]:
+    boxes = _parse_isobmff_boxes(data)
+    if not boxes:
+        raise ValueError(f"not a valid {fmt.upper()} (no ISOBMFF boxes)")
+
+    actions: list[str] = []
+    out = bytearray()
+
+    for fourcc, payload, size, header_size in boxes:
+        name = fourcc.decode("latin-1", errors="replace")
+        if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
+            actions.append(f"drop top-level {name} box (C2PA/JUMBF)")
+            continue
+
+        if fourcc == b"uuid":
+            if payload.startswith(XMP_UUID):
+                actions.append(f"drop top-level {name} box (XMP metadata)")
+                continue
+            if strip_all_metadata or _contains_any(payload, AI_META_HINTS + C2PA_MARKERS):
+                actions.append(f"drop top-level {name} box (UUID metadata)")
+                continue
+
+        if fourcc == b"meta":
+            meta_verflags = payload[:4] if len(payload) >= 4 else b"\x00\x00\x00\x00"
+            sub_boxes = _parse_isobmff_boxes(payload, start=4)
+            clean_sub = bytearray()
+            for s_fourcc, s_payload, s_size, s_hdr in sub_boxes:
+                s_name = s_fourcc.decode("latin-1", errors="replace")
+                if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
+                    actions.append(f"drop meta sub-box {s_name} (C2PA/JUMBF)")
+                    continue
+                if s_fourcc == b"uuid":
+                    if s_payload.startswith(XMP_UUID):
+                        actions.append(f"drop meta sub-box {s_name} (XMP metadata)")
+                        continue
+                    if strip_all_metadata or _contains_any(
+                        s_payload, AI_META_HINTS + C2PA_MARKERS
+                    ):
+                        actions.append(f"drop meta sub-box {s_name} (UUID metadata)")
+                        continue
+                if s_fourcc in (b"xml ", b"bxml"):
+                    if strip_all_metadata or _contains_any(
+                        s_payload, AI_META_HINTS + C2PA_MARKERS
+                    ):
+                        actions.append(f"drop meta sub-box {s_name} (XML metadata)")
+                        continue
+                clean_sub.extend(
+                    struct.pack(">I", len(s_payload) + 8) + s_fourcc + s_payload
+                )
+
+            new_meta_payload = meta_verflags + clean_sub
+            out.extend(
+                struct.pack(">I", len(new_meta_payload) + 8) + b"meta" + new_meta_payload
+            )
+            continue
+
+        out.extend(struct.pack(">I", len(payload) + 8) + fourcc + payload)
+
+    if not actions:
+        actions.append(
+            f"no {fmt.upper()} metadata boxes removed (already clean or none matched)"
+        )
+
+    return bytes(out), actions
+
+
 def clean_image(
     path: Path,
     dest: Path,
@@ -811,6 +1021,8 @@ def clean_image(
         cleaned, actions = strip_jpeg(data, strip_all_app=strip_all_metadata)
     elif fmt == "webp":
         cleaned, actions = strip_webp(data, strip_all_metadata=strip_all_metadata)
+    elif fmt in ("avif", "heic"):
+        cleaned, actions = strip_isobmff(data, fmt, strip_all_metadata=strip_all_metadata)
     else:
         raise ValueError(f"unsupported format: {fmt}")
 

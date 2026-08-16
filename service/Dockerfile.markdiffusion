@@ -1,7 +1,7 @@
 # Optional local Docker image for the MarkDiffusion image-watermark harness.
 #
-# Build from the repository root:
-#   docker build -f Dockerfile.markdiffusion -t watermarks-remover-markdiffusion .
+# Build from the repository root (build context = service/):
+#   docker build -f service/Dockerfile.markdiffusion -t watermarks-remover-markdiffusion service/
 #
 # The upstream package is installed from PyPI at build time (pinned in
 # requirements-markdiffusion.txt) and is NOT redistributed by this repository.
@@ -24,8 +24,9 @@ RUN apt-get update \
         passwd \
     && rm -rf /var/lib/apt/lists/*
 
-COPY skills/remove-ai-marks/scripts/requirements-markdiffusion.txt /app/requirements-markdiffusion.txt
-COPY skills/remove-ai-marks/scripts/markdiffusion_harness.py /app/markdiffusion_harness.py
+COPY scripts/requirements-markdiffusion.txt /app/requirements-markdiffusion.txt
+COPY scripts/markdiffusion_harness.py /app/markdiffusion_harness.py
+COPY scripts/common.py /app/common.py
 
 # torch is pinned (with everything else) in requirements-markdiffusion.txt; the
 # CPU index keeps the image small. No GPU wheel index inside the image — CUDA

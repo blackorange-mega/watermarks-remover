@@ -16,6 +16,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -90,13 +91,17 @@ def main() -> int:
             return 2
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        codebook_v4 = SpectralCodebookV4()
-        codebook_v4.load(str(codebook))
+        # Upstream prints progress ("CodebookV4 loaded: ...") straight to
+        # stdout, which corrupts --json for any caller that parses us
+        # (image_meta.py json.loads our stdout). Keep stdout ours alone.
+        with contextlib.redirect_stdout(sys.stderr):
+            codebook_v4 = SpectralCodebookV4()
+            codebook_v4.load(str(codebook))
 
-        extractor = RobustSynthIDExtractor()
-        result = extractor.detect_from_v4_codebook(
-            rgb, codebook_v4, model=args.model
-        )
+            extractor = RobustSynthIDExtractor()
+            result = extractor.detect_from_v4_codebook(
+                rgb, codebook_v4, model=args.model
+            )
     except Exception as e:
         print(f"scorer error: {e}", file=sys.stderr)
         return 1

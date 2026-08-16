@@ -52,6 +52,11 @@ def main() -> int:
     p.add_argument("path", type=Path, help="Directory to audit recursively")
     p.add_argument("--json", action="store_true", help="Emit a JSON report")
     p.add_argument(
+        "--check-stylometry",
+        action="store_true",
+        help="Also evaluate text files for AI statistical & stylometric signals",
+    )
+    p.add_argument(
         "--skip",
         default="",
         help="Comma-separated extra directory names to skip",
@@ -76,7 +81,7 @@ def main() -> int:
             if path.stat().st_size > MAX_INPUT_BYTES:
                 skipped.append({"path": str(path), "reason": "too large"})
                 continue
-            files.append(scan_file(path))
+            files.append(scan_file(path, check_stylometry=args.check_stylometry))
         except Exception as e:  # keep the audit going on one bad file
             skipped.append({"path": str(path), "reason": str(e)})
 

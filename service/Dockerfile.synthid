@@ -1,7 +1,7 @@
 # Optional local Docker image for the reverse-SynthID pixel scorer.
 #
-# Build from the repository root:
-#   docker build -f Dockerfile.synthid -t watermarks-remover-synthid-scorer .
+# Build from the repository root (build context = service/):
+#   docker build -f service/Dockerfile.synthid -t watermarks-remover-synthid-scorer service/
 #
 # The upstream code is fetched from source at build time and is NOT
 # redistributed by this repository. Users must comply with the upstream
@@ -18,7 +18,7 @@
 # Pinned upstream commit (2026-07-17). Keep in sync with setup_synthid.sh.
 ARG REVERSE_SYNTHID_REF=b11083676fd3ee3ff97ce9d03c0e409e46905902
 
-# python:3.11-slim linux/amd64 digest.
+# python:3.14-slim linux/amd64 digest.
 FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
 
 ARG REVERSE_SYNTHID_REF
@@ -43,8 +43,8 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
         '/LICENSE' \
         '/README.md'
 
-COPY skills/remove-ai-marks/scripts/requirements-synthid-scorer.txt /app/requirements-synthid-scorer.txt
-COPY skills/remove-ai-marks/scripts/score_synthid.py /app/score_synthid.py
+COPY scripts/requirements-synthid-scorer.txt /app/requirements-synthid-scorer.txt
+COPY scripts/score_synthid.py /app/score_synthid.py
 
 RUN python3 -m pip install --no-cache-dir "pip==26.2.1" \
     && python3 -m pip install --no-cache-dir -r /app/requirements-synthid-scorer.txt

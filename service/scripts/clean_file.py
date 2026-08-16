@@ -19,7 +19,7 @@ from common import (  # noqa: E402
     guard_binary,
     safe_write_text,
 )
-from container_meta import clean_container  # noqa: E402
+from container_meta import clean_container, detect_container_format  # noqa: E402
 from format_dispatch import classify  # noqa: E402
 from image_meta import clean_image  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
@@ -60,6 +60,14 @@ def main() -> int:
         return 2
 
     kind = args.force_type if args.force_type != "auto" else classify(args.path)
+
+    # In-place cleaning reads from a .bak copy whose suffix would make
+    # markdown/HTML (detected by extension, not magic bytes) classify as
+    # "unknown". Pin the format from the original path so --in-place and -o
+    # route identically.
+    container_fmt = None
+    if kind == "container":
+        container_fmt = detect_container_format(args.path, args.path.read_bytes())
 
     # classify() falls back to "text" for unrecognised bytes, so an unknown
     # binary would otherwise be decoded, scrubbed and written back mangled.
@@ -128,7 +136,7 @@ def main() -> int:
         return 1 if residual else 0
 
     try:
-        result = clean_container(src, dest)
+        result = clean_container(src, dest, fmt=container_fmt)
     except Exception as e:
         eprint(f"error: {e}")
         return 1

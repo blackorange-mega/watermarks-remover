@@ -1,7 +1,7 @@
 # Optional local Docker image for the MarkLLM text-watermark harness.
 #
-# Build from the repository root:
-#   docker build -f Dockerfile.markllm -t watermarks-remover-markllm .
+# Build from the repository root (build context = service/):
+#   docker build -f service/Dockerfile.markllm -t watermarks-remover-markllm service/
 #
 # The upstream code is fetched from source at build time and is NOT
 # redistributed by this repository. Upstream is Apache-2.0.
@@ -45,13 +45,15 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
         '/README.md' \
     && test "$(git -C /opt/markllm rev-parse HEAD)" = "${MARKLLM_REF}"
 
-COPY skills/remove-ai-marks/scripts/requirements-markllm.txt /app/requirements-markllm.txt
-COPY skills/remove-ai-marks/scripts/detect_text_watermark.py /app/detect_text_watermark.py
+COPY scripts/requirements-markllm.txt /app/requirements-markllm.txt
+COPY scripts/detect_text_watermark.py /app/detect_text_watermark.py
+COPY scripts/common.py /app/common.py
 
-# torch is pinned (with everything else) in requirements-markllm.txt; there is
-# no separate unpinned install step. No GPU wheel index inside the image —
-# CUDA users should run setup_markllm.sh on the host instead.
+# torch is installed first from the CPU index (like Dockerfile.markdiffusion);
+# the remaining pinned deps then resolve against it. No GPU wheel index inside
+# the image — CUDA users should run setup_markllm.sh on the host instead.
 RUN python3 -m pip install --no-cache-dir "pip==26.2.1" \
+    && python3 -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch>=2.13,<2.14" \
     && python3 -m pip install --no-cache-dir -r /app/requirements-markllm.txt
 
 # Unprivileged runtime user. The harness only reads input files and writes to

@@ -26,7 +26,7 @@ updates:
   # step will flag any security regression, but functional compatibility must
   # be checked by a human.
   - package-ecosystem: "pip"
-    directory: "/skills/remove-ai-marks/scripts"
+    directory: "/service/scripts"
     schedule:
       interval: "weekly"
       day: "monday"
