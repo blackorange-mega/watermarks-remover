@@ -6,6 +6,7 @@ aggregate summary can be computed and rendered consistently.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,9 @@ def scan_file(
             s_rep = score_text_stylometry(text, path=name)
             item["stylometry"] = s_rep.to_dict()
             if s_rep.score >= 0.65:
-                item["findings"].append(f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})")
+                item["findings"].append(
+                    f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})"
+                )
                 item["confidence"].append("probable")
                 item["suspicious_total"] += 1
         return item
@@ -98,7 +101,9 @@ def scan_file(
             s_rep = score_text_stylometry(text, path=name)
             stylometry_dict = s_rep.to_dict()
             if s_rep.score >= 0.65:
-                findings.append(f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})")
+                findings.append(
+                    f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})"
+                )
                 confidences.append("probable")
                 suspicious += 1
 
@@ -152,7 +157,9 @@ def aggregate(files: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def print_human_report(files: list[dict[str, Any]], summary: dict[str, Any], extra_header: dict[str, Any] | None = None) -> None:
+def print_human_report(
+    files: list[dict[str, Any]], summary: dict[str, Any], extra_header: dict[str, Any] | None = None
+) -> None:
     """Shared plain-text rendering for audit scripts."""
     for key, value in (extra_header or {}).items():
         print(f"{key}: {value}")
@@ -164,5 +171,125 @@ def print_human_report(files: list[dict[str, Any]], summary: dict[str, Any], ext
     print(f"Actionable files: {summary['actionable_files']}")
     print(f"Findings by confidence: {summary['findings_by_confidence']}")
     for item in files:
-        for msg, conf in zip(item.get("findings", []), item.get("confidence", [])):
+        for msg, conf in zip(item.get("findings", []), item.get("confidence", []), strict=False):
             print(f"  [{conf}] {item['path']}: {msg}")
+
+
+def format_sarif(report: dict[str, Any]) -> dict[str, Any]:
+    """Convert an aggregate audit report into OASIS SARIF 2.1.0 format."""
+    rules = [
+        {
+            "id": "AI-WATERMARK-C2PA",
+            "name": "C2PAManifestDetected",
+            "shortDescription": {"text": "C2PA / Content Credentials provenance manifest detected"},
+            "fullDescription": {
+                "text": "A C2PA provenance manifest or JUMBF metadata box was detected in the asset."
+            },
+            "defaultConfiguration": {"level": "error"},
+            "properties": {"tags": ["provenance", "c2pa", "watermark"]},
+        },
+        {
+            "id": "AI-WATERMARK-METADATA",
+            "name": "AIMetadataMarkerDetected",
+            "shortDescription": {"text": "AI generation metadata or provenance markers detected"},
+            "fullDescription": {
+                "text": "AI metadata markers or container generator tags were detected in the file."
+            },
+            "defaultConfiguration": {"level": "warning"},
+            "properties": {"tags": ["provenance", "ai-generated"]},
+        },
+        {
+            "id": "AI-WATERMARK-UNICODE-LAYER-A",
+            "name": "InvisibleUnicodeWatermarkCarrier",
+            "shortDescription": {
+                "text": "Suspicious invisible Unicode or zero-width watermark carriers detected"
+            },
+            "fullDescription": {
+                "text": "Invisible Unicode formatting characters or homoglyph spaces used as watermark carriers were found in the text."
+            },
+            "defaultConfiguration": {"level": "warning"},
+            "properties": {"tags": ["watermark", "unicode", "layer-a"]},
+        },
+        {
+            "id": "AI-STYLES-HIGH-PROBABILITY",
+            "name": "HighProbabilityAITextCadence",
+            "shortDescription": {
+                "text": "High-probability statistical & stylometric AI text cadence detected"
+            },
+            "fullDescription": {
+                "text": "Stylometric analysis flagged the text as highly likely to be machine-generated."
+            },
+            "defaultConfiguration": {"level": "note"},
+            "properties": {"tags": ["stylometry", "ai-text"]},
+        },
+    ]
+
+    results = []
+    root_str = report.get("root", "")
+
+    for item in report.get("files", []):
+        file_path = item.get("path", "")
+        if root_str:
+            try:
+                rel_uri = os.path.relpath(file_path, root_str).replace("\\", "/")
+            except Exception:
+                rel_uri = file_path.replace("\\", "/")
+        else:
+            rel_uri = file_path.replace("\\", "/")
+
+        findings = item.get("findings", [])
+        confidences = item.get("confidence", [])
+
+        for msg, conf in zip(findings, confidences, strict=False):
+            rule_id = "AI-WATERMARK-METADATA"
+            level = "warning"
+
+            if "c2pa" in msg.lower() or "jumbf" in msg.lower() or item.get("has_c2pa"):
+                rule_id = "AI-WATERMARK-C2PA"
+                level = "error"
+            elif "layer-a" in msg.lower():
+                rule_id = "AI-WATERMARK-UNICODE-LAYER-A"
+                level = "warning" if conf in ("confirmed", "probable") else "note"
+            elif "stylometry" in msg.lower():
+                rule_id = "AI-STYLES-HIGH-PROBABILITY"
+                level = "note"
+            elif conf == "confirmed":
+                level = "error"
+            elif conf == "informational":
+                level = "note"
+
+            results.append(
+                {
+                    "ruleId": rule_id,
+                    "level": level,
+                    "message": {"text": msg},
+                    "locations": [
+                        {
+                            "physicalLocation": {
+                                "artifactLocation": {
+                                    "uri": rel_uri,
+                                    "uriBaseId": "%SRCROOT%",
+                                }
+                            }
+                        }
+                    ],
+                }
+            )
+
+    return {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "watermarks-remover",
+                        "version": "0.1.0",
+                        "informationUri": "https://github.com/guillaumemeyer/watermarks-remover",
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }

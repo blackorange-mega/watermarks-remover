@@ -32,7 +32,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from common import eprint, emit_json, read_text_input, safe_write_text  # noqa: E402
+from common import emit_json, eprint, read_text_input, safe_write_text  # noqa: E402
 
 # Scheme name as the user types it -> MarkLLM algorithm name (config/{ALG}.json).
 SCHEMES = {
@@ -71,10 +71,10 @@ def resolve_device(raw: str | None) -> str:
 
         if torch.cuda.is_available():
             return "cuda"
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            return "mps"
-    except Exception:
+        # Never auto-select mps: SynthID/KGW build torch.Generator(device=...),
+        # which supports only cpu/cuda and raises RuntimeError on 'mps' (Apple
+        # Silicon). Fall through to cpu. Pass --device mps explicitly to override.
+    except Exception:  # noqa: S110 - optional torch device detection
         pass
     return "cpu"
 
@@ -85,9 +85,9 @@ def _load_algorithm(
     """Import the checkout and build an ``AutoWatermark`` instance."""
     sys.path.insert(0, str(upstream))
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
-        from utils.transformers_config import TransformersConfig  # noqa: E402
-        from watermark.auto_watermark import AutoWatermark  # noqa: E402
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.transformers_config import TransformersConfig
+        from watermark.auto_watermark import AutoWatermark
     except ImportError as e:
         raise _Unavailable(f"MarkLLM dependencies missing: {e}") from e
 
@@ -131,10 +131,7 @@ def _threshold_from_config(config: Path) -> float | None:
 
 
 def _resolve_config(upstream: Path, alg: str, config: str | None) -> Path:
-    if config:
-        path = Path(config).expanduser().resolve()
-    else:
-        path = upstream / "config" / f"{alg}.json"
+    path = Path(config).expanduser().resolve() if config else upstream / "config" / f"{alg}.json"
     if not path.is_file():
         raise _Unavailable(f"MarkLLM config not found: {path}")
     try:
@@ -142,9 +139,7 @@ def _resolve_config(upstream: Path, alg: str, config: str | None) -> Path:
     except OSError as e:
         raise _Unavailable(f"cannot stat MarkLLM config {path}: {e}") from e
     if size > MAX_CONFIG_BYTES:
-        raise _Unavailable(
-            f"MarkLLM config too large ({size} bytes > {MAX_CONFIG_BYTES}): {path}"
-        )
+        raise _Unavailable(f"MarkLLM config too large ({size} bytes > {MAX_CONFIG_BYTES}): {path}")
     return path
 
 
@@ -159,9 +154,7 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     try:
         config = _resolve_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
-        wm = _load_algorithm(
-            upstream, alg, config, args.model, device, offline=args.offline
-        )
+        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
         result = wm.detect_watermark(text, return_dict=True)
     except _Unavailable as e:
         eprint(str(e))
@@ -207,9 +200,7 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
 
     try:
         config = _resolve_config(upstream, alg, args.config)
-        wm = _load_algorithm(
-            upstream, alg, config, args.model, device, offline=args.offline
-        )
+        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
         if args.seed is not None:
             import torch
 
@@ -250,7 +241,9 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     else:
         print(f"{alg}: watermarked sample ({payload['watermarked_chars']} chars) -> {wm_out}")
         if unwatermarked is not None:
-            print(f"      unwatermarked sample ({payload['unwatermarked_chars']} chars) -> {args.unwatermarked_output}")
+            print(
+                f"      unwatermarked sample ({payload['unwatermarked_chars']} chars) -> {args.unwatermarked_output}"
+            )
 
     return 0
 
@@ -308,10 +301,18 @@ def main() -> int:
 
     wm = sub.add_parser("watermark", help="Generate watermarked sample text")
     wm.add_argument("prompt", help="Prompt file, or - for stdin")
-    wm.add_argument("-o", "--watermarked-output", default=None,
-                    help="Output path for the watermarked sample (default: stdout)")
-    wm.add_argument("-o2", "--unwatermarked-output", default=None,
-                    help="Also write an unwatermarked sample to this path")
+    wm.add_argument(
+        "-o",
+        "--watermarked-output",
+        default=None,
+        help="Output path for the watermarked sample (default: stdout)",
+    )
+    wm.add_argument(
+        "-o2",
+        "--unwatermarked-output",
+        default=None,
+        help="Also write an unwatermarked sample to this path",
+    )
     wm.add_argument("--max-new-tokens", type=int, default=200)
     wm.add_argument("--min-length", type=int, default=0)
     wm.add_argument("--seed", type=int, default=None, help="Optional RNG seed")

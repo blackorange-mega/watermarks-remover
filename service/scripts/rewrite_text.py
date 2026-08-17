@@ -23,6 +23,7 @@ Security notes:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -36,8 +37,8 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import cleaned_path, eprint, read_text_input, write_text_output  # noqa: E402
-from text_unicode import clean_text  # noqa: E402
+from common import cleaned_path, eprint, read_text_input, write_text_output
+from text_unicode import clean_text
 
 DEFAULT_MARKLLM_MODEL = "facebook/opt-1.3b"
 
@@ -87,7 +88,7 @@ def _tokens(text: str) -> list[str]:
 
 
 def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
-    return set(zip(tokens, tokens[1:]))
+    return set(itertools.pairwise(tokens))
 
 
 def _lexical_divergence(original: str, candidate: str) -> float:
@@ -169,7 +170,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     host behind the localhost allowlist. Any 3xx now surfaces as HTTPError.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
@@ -253,6 +254,7 @@ def _markllm_detect(
             text=True,
             timeout=timeout,
             preexec_fn=_markllm_preexec(),
+            check=False,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError) as e:
         return {"available": False, "error": f"MarkLLM adapter error: {e}"}
@@ -296,7 +298,8 @@ def _http_json(url: str, payload: dict, headers: dict[str, str], timeout: float)
     if urlparse(url).scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) rewrite endpoint: {url}")
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
+    # S310: URL scheme is restricted to http/https just above.
+    req = urllib.request.Request(  # noqa: S310
         url,
         data=body,
         headers={"Content-Type": "application/json", **headers},
@@ -307,9 +310,7 @@ def _http_json(url: str, payload: dict, headers: dict[str, str], timeout: float)
         return json.loads(resp.read().decode("utf-8"))
 
 
-def call_ollama(
-    base_url: str, model: str, prompt: str, timeout: float, temperature: float
-) -> str:
+def call_ollama(base_url: str, model: str, prompt: str, timeout: float, temperature: float) -> str:
     url = base_url.rstrip("/") + "/api/chat"
     data = _http_json(
         url,
@@ -589,9 +590,7 @@ def main() -> int:
             temperature=args.temperature,
             candidates=args.candidates,
             allow_remote=allow_remote,
-            reasoning_effort=(
-                None if args.reasoning_effort == "off" else args.reasoning_effort
-            ),
+            reasoning_effort=(None if args.reasoning_effort == "off" else args.reasoning_effort),
             markllm_scheme=args.markllm_scheme,
             markllm_dir=args.markllm_dir,
             markllm_model=args.markllm_model,

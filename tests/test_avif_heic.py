@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from format_dispatch import classify, classify_bytes  # noqa: E402
-from image_meta import (  # noqa: E402
+from format_dispatch import classify_bytes
+from image_meta import (
     XMP_UUID,
     clean_image,
     detect_format,
@@ -95,7 +95,7 @@ def test_inspect_isobmff_detects_c2pa_and_xmp():
 
 def test_inspect_isobmff_heic_ai_metadata():
     heic_bytes = _minimal_heic_with_xmp()
-    has_c2pa, has_ai, findings = inspect_isobmff(heic_bytes, "heic")
+    _has_c2pa, has_ai, findings = inspect_isobmff(heic_bytes, "heic")
     assert has_ai is True
     assert any("trainedAlgorithmicMedia" in f or "XMP" in f for f in findings)
 
@@ -108,7 +108,7 @@ def test_strip_isobmff_removes_c2pa_and_xmp():
     assert any("xmp" in a.lower() or "uuid" in a.lower() for a in actions)
 
     # Re-inspect cleaned bytes
-    has_c2pa, has_ai, findings = inspect_isobmff(cleaned, "avif")
+    has_c2pa, has_ai, _findings = inspect_isobmff(cleaned, "avif")
     assert has_c2pa is False
     assert has_ai is False
 

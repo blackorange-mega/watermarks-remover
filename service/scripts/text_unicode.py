@@ -164,7 +164,7 @@ LATIN_CONFUSABLES: dict[int, str] = {
     0xFF5A: "z",
 }
 
-# Variation selectors beyond FE0x (VS17–VS256 in Supplementary Special-purpose)
+# Variation selectors beyond FE0x (VS17-VS256 in Supplementary Special-purpose)
 _VS_SUPPLEMENT = range(0xE0100, 0xE01F0)
 
 
@@ -187,8 +187,10 @@ _BIDI_CPS: frozenset[int] = frozenset(
 )
 
 # Directional marks and isolates are legitimate in mixed RTL/LTR prose. Inspect
-# them, but preserve them during the default clean. Embeddings and overrides
-# remain destructive by default because they can reorder unrelated spans.
+# them, but preserve them during the default clean. Paired LRE/RLE embeddings
+# (see _valid_bidi_embedding_indices) are preserved too; overrides and
+# unpaired embeddings remain destructive by default because they can reorder
+# unrelated spans.
 _PRESERVABLE_BIDI_CPS: frozenset[int] = frozenset(
     {
         0x061C,
@@ -202,9 +204,7 @@ _PRESERVABLE_BIDI_CPS: frozenset[int] = frozenset(
 )
 
 # Zero-width family (common edit-based carriers)
-_ZW_FAMILY: frozenset[int] = frozenset(
-    {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E}
-)
+_ZW_FAMILY: frozenset[int] = frozenset({0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E})
 
 
 def _is_private_use(cp: int) -> bool:
@@ -217,12 +217,10 @@ def _is_strip_cp(cp: int) -> bool:
         return True
     if cp in _VS_SUPPLEMENT:
         return True
-    # Tag characters used in some stego schemes (U+E0001–U+E007F)
+    # Tag characters used in some stego schemes (U+E0001-U+E007F)
     if 0xE0001 <= cp <= 0xE007F:
         return True
-    if _is_private_use(cp):
-        return True
-    return False
+    return bool(_is_private_use(cp))
 
 
 def _strip_kind(cp: int) -> str:
@@ -263,9 +261,8 @@ def _is_emoji_base(cp: int) -> bool:
         return True
     if cp in (0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299):
         return True
-    if cp in (0x0023, 0x002A) or 0x0030 <= cp <= 0x0039:  # keycap bases
-        return True
-    return False
+    # keycap bases
+    return cp in (0x0023, 0x002A) or 0x0030 <= cp <= 0x0039
 
 
 # ZWNJ/ZWJ are orthographic inside complex scripts (Persian می‌روم, Devanagari
@@ -647,8 +644,7 @@ def human_report(report: TextInspectReport) -> str:
         lines.append("Hits:")
         for h in report.hits:
             lines.append(
-                f"  [{h.kind}/{_hit_confidence(h.kind)}] "
-                f"{h.label} x{h.count} @ {h.samples[:5]}"
+                f"  [{h.kind}/{_hit_confidence(h.kind)}] {h.label} x{h.count} @ {h.samples[:5]}"
             )
     for n in report.notes:
         lines.append(f"Note: {n}")

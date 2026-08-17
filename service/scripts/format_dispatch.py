@@ -16,12 +16,27 @@ from image_meta import detect_format as detect_image_format
 
 Kind = Literal["text", "image", "container"]
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".heic", ".heif"}
+IMAGE_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".avif",
+    ".heic",
+    ".heif",
+    ".bmp",
+    ".gif",
+    ".tiff",
+    ".tif",
+}
 CONTAINER_EXTS = {
     ".svg",
     ".pdf",
     ".docx",
+    ".xlsx",
+    ".pptx",
     ".odt",
+    ".epub",
     ".html",
     ".htm",
     ".md",
@@ -61,7 +76,7 @@ def classify_bytes(data: bytes, suffix: str | None = None) -> Kind:
         return "container"
     if ext in TEXT_EXTS:
         return "text"
-    if detect_image_format(data) in ("png", "jpeg", "webp", "avif", "heic"):
+    if detect_image_format(data) in ("png", "jpeg", "webp", "avif", "heic", "bmp", "gif", "tiff"):
         return "image"
     if data:
         sniff_path = Path("input") if not ext else Path(f"input{ext}")

@@ -24,6 +24,7 @@
 !/pytest.ini
 !/README.md
 !/requirements-dev.txt
+!/ruff.toml
 !/SECURITY.md
 
 # Exceptions even inside allowed trees

@@ -16,8 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import rewrite_text  # noqa: E402
-from rewrite_text import (  # noqa: E402
+from rewrite_text import (
     _check_remote,
     _flag_env,
     _lexical_divergence,
@@ -178,7 +177,7 @@ def test_openai_compatible_sends_reasoning_effort_when_set():
             self.end_headers()
             self.wfile.write(b'{"choices": [{"message": {"content": "rewritten"}}]}')
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collector)
@@ -227,7 +226,7 @@ def test_rewrite_blocks_redirect_and_never_sends_key():
             )
             self.end_headers()
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             pass
 
     class Collector(http.server.BaseHTTPRequestHandler):
@@ -236,11 +235,9 @@ def test_rewrite_blocks_redirect_and_never_sends_key():
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(
-                b'{"choices": [{"message": {"content": "rewritten"}}]}'
-            )
+            self.wfile.write(b'{"choices": [{"message": {"content": "rewritten"}}]}')
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             pass
 
     collector = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collector)
@@ -252,9 +249,7 @@ def test_rewrite_blocks_redirect_and_never_sends_key():
         with pytest.raises(urllib.error.HTTPError):
             rewrite(
                 "secret text",
-                **_rewrite_http_kwargs(
-                    f"http://127.0.0.1:{redirector.server_address[1]}"
-                ),
+                **_rewrite_http_kwargs(f"http://127.0.0.1:{redirector.server_address[1]}"),
             )
         time.sleep(0.2)
         assert captured == {}, "redirect target received a request (key leak?)"

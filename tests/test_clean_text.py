@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from text_unicode import clean_text, inspect_text  # noqa: E402
+from text_unicode import clean_text, inspect_text
 
 
 def test_strips_zero_width_and_soft_hyphen():
@@ -107,16 +107,16 @@ def test_clean_preserves_arrow_emoji_vs16():
 
 
 def test_clean_preserves_cjk_ideographic_variation_selector():
-    raw = "\u845b\U000E0100"  # CJK ideograph + VS17
+    raw = "\u845b\U000e0100"  # CJK ideograph + VS17
     cleaned, stats = clean_text(raw)
     assert cleaned == raw
     assert stats["removed_count"] == 0
 
 
 def test_clean_strips_repeated_cjk_variation_selector():
-    raw = "\u845b\U000E0100\U000E0101"
+    raw = "\u845b\U000e0100\U000e0101"
     cleaned, stats = clean_text(raw)
-    assert cleaned == "\u845b\U000E0100"
+    assert cleaned == "\u845b\U000e0100"
     assert stats["removed_count"] == 1
 
 
@@ -128,14 +128,14 @@ def test_clean_preserves_mongolian_variation_selector():
 
 
 def test_clean_preserves_zwj_family():
-    raw = "Family time: \U0001F468\u200D\U0001F469\u200D\U0001F467"  # 👨‍👩‍👧
+    raw = "Family time: \U0001f468\u200d\U0001f469\u200d\U0001f467"  # 👨‍👩‍👧
     cleaned, stats = clean_text(raw)
     assert cleaned == raw
     assert stats["removed_count"] == 0
 
 
 def test_clean_preserves_zwj_chain():
-    raw = "\u2764\ufe0f\u200d\U0001F525"  # ❤️‍🔥
+    raw = "\u2764\ufe0f\u200d\U0001f525"  # ❤️‍🔥
     cleaned, stats = clean_text(raw)
     assert cleaned == raw
     assert stats["removed_count"] == 0
@@ -149,7 +149,7 @@ def test_clean_strips_floating_emoji_glue():
 
 
 def test_inspect_emoji_glue_not_suspicious_by_default():
-    raw = "Balance returns. \u2696\ufe0f Family time: \U0001F468\u200D\U0001F469\u200D\U0001F467"
+    raw = "Balance returns. \u2696\ufe0f Family time: \U0001f468\u200d\U0001f469\u200d\U0001f467"
     report = inspect_text(raw)
     assert report.suspicious_total == 0
 
@@ -182,15 +182,15 @@ def test_clean_preserves_script_joiners():
 
 def test_clean_preserves_flag_tag_sequence():
     # Scotland flag: emoji base U+1F3F4 + tag chars ending in U+E007F.
-    raw = "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F"
+    raw = "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f"
     cleaned, _ = clean_text(raw)
     assert cleaned == raw
 
 
 def test_clean_strips_incomplete_flag_tag_sequence():
-    raw = "\U0001F3F4\U000E0067\U000E0062"
+    raw = "\U0001f3f4\U000e0067\U000e0062"
     cleaned, stats = clean_text(raw)
-    assert cleaned == "\U0001F3F4"
+    assert cleaned == "\U0001f3f4"
     assert stats["removed_count"] == 2
 
 
@@ -271,7 +271,9 @@ def test_clean_still_strips_floating_script_glue():
     # Isolated between Latin these are contraband, not orthography.
     for raw in ("a\u180bb", "a\u17b4b", "a\u115fb", "\u180b", "\u1160"):
         cleaned, _ = clean_text(raw)
-        assert cleaned == raw.replace("\u180b", "").replace("\u17b4", "").replace("\u115f", "").replace("\u1160", "")
+        assert cleaned == raw.replace("\u180b", "").replace("\u17b4", "").replace(
+            "\u115f", ""
+        ).replace("\u1160", "")
 
 
 def test_clean_strip_emoji_glue_flag_strips_script_glue():

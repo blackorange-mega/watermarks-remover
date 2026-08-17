@@ -35,17 +35,17 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (  # noqa: E402
+from common import (
     MAX_INPUT_BYTES,
-    looks_binary,
     eprint,
+    looks_binary,
     which,
 )
-from container_meta import clean_container, inspect_container  # noqa: E402
-from format_dispatch import classify_bytes  # noqa: E402
-from image_meta import clean_image, inspect_image  # noqa: E402
-from score_stylometry import score_text_stylometry  # noqa: E402
-from text_unicode import clean_text, inspect_text  # noqa: E402
+from container_meta import clean_container, inspect_container
+from format_dispatch import classify_bytes
+from image_meta import clean_image, inspect_image
+from score_stylometry import score_text_stylometry
+from text_unicode import clean_text, inspect_text
 
 VERSION = os.environ.get("WATERMARKS_SERVER_VERSION", "dev")
 
@@ -97,6 +97,7 @@ def capabilities() -> dict[str, Any]:
 # plus live runtime values (version, auth, allowed options), so it can never
 # drift from the endpoints the handler actually serves. Served at /openapi.json.
 
+
 def _schema(**props: Any) -> dict[str, Any]:
     return props
 
@@ -133,7 +134,9 @@ def _clean_request_schema() -> dict[str, Any]:
             options[key] = _schema(type="string")
     return _file_request(
         {
-            "properties": {"options": _schema(type="object", properties=options, additionalProperties=False)},
+            "properties": {
+                "options": _schema(type="object", properties=options, additionalProperties=False)
+            },
         }
     )
 
@@ -161,11 +164,15 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                         "version": _schema(type="string"),
                         "tools": _schema(
                             type="object",
-                            properties={k: _schema(type="boolean") for k in ("c2patool", "exiftool", "qpdf")},
+                            properties={
+                                k: _schema(type="boolean") for k in ("c2patool", "exiftool", "qpdf")
+                            },
                         ),
                         "pixel_backends": _schema(
                             type="object",
-                            properties={k: _schema(type="boolean") for k in ("ctrlregen", "diffusion")},
+                            properties={
+                                k: _schema(type="boolean") for k in ("ctrlregen", "diffusion")
+                            },
                         ),
                         "scorers": _schema(
                             type="object",
@@ -174,7 +181,9 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                                 "stylometry": _schema(type="boolean"),
                             },
                         ),
-                        "harnesses": _schema(type="object", properties={"markllm": _schema(type="boolean")}),
+                        "harnesses": _schema(
+                            type="object", properties={"markllm": _schema(type="boolean")}
+                        ),
                     },
                 )
             },
@@ -221,7 +230,9 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                     properties={
                         "ok": _schema(type="boolean"),
                         "kind": _schema(type="string", enum=["text", "image", "container"]),
-                        "cleaned": _schema(type="string", description="Base64-encoded cleaned file bytes"),
+                        "cleaned": _schema(
+                            type="string", description="Base64-encoded cleaned file bytes"
+                        ),
                         "report": _schema(type="object"),
                     },
                 )
@@ -235,11 +246,23 @@ _ERROR_SCHEMA = _schema(
     properties={"ok": _schema(type="boolean", enum=[False]), "error": _schema(type="string")},
 )
 _COMMON_ERRORS = {
-    "400": {"description": "Bad request", "content": {"application/json": {"schema": _ERROR_SCHEMA}}},
-    "401": {"description": "Missing/invalid bearer token", "content": {"application/json": {"schema": _ERROR_SCHEMA}}},
+    "400": {
+        "description": "Bad request",
+        "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+    },
+    "401": {
+        "description": "Missing/invalid bearer token",
+        "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+    },
     "404": {"description": "Not found", "content": {"application/json": {"schema": _ERROR_SCHEMA}}},
-    "413": {"description": "Request body too large", "content": {"application/json": {"schema": _ERROR_SCHEMA}}},
-    "500": {"description": "Internal error", "content": {"application/json": {"schema": _ERROR_SCHEMA}}},
+    "413": {
+        "description": "Request body too large",
+        "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+    },
+    "500": {
+        "description": "Internal error",
+        "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+    },
 }
 
 
@@ -256,7 +279,7 @@ def openapi_spec() -> dict[str, Any]:
             paths.setdefault(path, {})[method] = {
                 "summary": op["summary"],
                 "responses": responses,
-                **(op.get("requestBody") and {"requestBody": op["requestBody"]} or {}),
+                **((op.get("requestBody") and {"requestBody": op["requestBody"]}) or {}),
             }
 
     spec: dict[str, Any] = {
@@ -316,7 +339,7 @@ def _decode_input(body: dict[str, Any]) -> tuple[bytes, str]:
     try:
         data = base64.b64decode(raw, validate=True)
     except (binascii.Error, ValueError):
-        raise ValueError("'file' is not valid base64")
+        raise ValueError("'file' is not valid base64") from None
     return data, _safe_name(name or "")
 
 
@@ -324,7 +347,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"watermarks-remover/{VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        eprint("%s - %s" % (self.address_string(), fmt % args))
+        eprint(f"{self.address_string()} - {fmt % args}")
 
     def _authorized(self) -> bool:
         if not API_KEY:
@@ -356,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         if not self._authorized():
             self._respond(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
@@ -370,7 +393,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         if not self._authorized():
             self._respond(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
@@ -399,9 +422,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_clean(data, name, body)
         except ValueError as e:
             self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(e)})
-        except Exception as e:  # noqa: BLE001 — report, do not leak internals
+        except Exception as e:
             eprint(f"error handling {path}: {e!r}")
-            self._respond(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal error"})
+            self._respond(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal error"}
+            )
 
     def _handle_inspect(self, data: bytes, name: str) -> None:
         kind = classify_bytes(data, Path(name).suffix)
@@ -410,7 +435,9 @@ class Handler(BaseHTTPRequestHandler):
             path.write_bytes(data)
             if kind == "text":
                 if looks_binary(data):
-                    raise ValueError("refusing to inspect bytes that look like a binary container as text")
+                    raise ValueError(
+                        "refusing to inspect bytes that look like a binary container as text"
+                    )
                 raw_text = data.decode("utf-8", errors="surrogateescape")
                 report = inspect_text(raw_text).to_dict()
                 s_rep = score_text_stylometry(raw_text, path=name or "<text>")
@@ -419,10 +446,14 @@ class Handler(BaseHTTPRequestHandler):
                 report = inspect_image(path).to_dict()
             else:
                 report = inspect_container(path).to_dict()
-        suspicious = bool(report.get("suspicious_total")) or bool(
-            report.get("has_c2pa") or report.get("has_ai_metadata")
-        ) or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
-        self._respond(HTTPStatus.OK, {"ok": True, "kind": kind, "report": report, "suspicious": suspicious})
+        suspicious = (
+            bool(report.get("suspicious_total"))
+            or bool(report.get("has_c2pa") or report.get("has_ai_metadata"))
+            or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
+        )
+        self._respond(
+            HTTPStatus.OK, {"ok": True, "kind": kind, "report": report, "suspicious": suspicious}
+        )
 
     def _handle_clean(self, data: bytes, name: str, body: dict[str, Any]) -> None:
         kind = classify_bytes(data, Path(name).suffix)
@@ -441,7 +472,9 @@ class Handler(BaseHTTPRequestHandler):
             src.write_bytes(data)
             if kind == "text":
                 if looks_binary(data):
-                    raise ValueError("refusing to clean bytes that look like a binary container as text")
+                    raise ValueError(
+                        "refusing to clean bytes that look like a binary container as text"
+                    )
                 text = data.decode("utf-8", errors="surrogateescape")
                 cleaned, stats = clean_text(
                     text,
@@ -468,7 +501,9 @@ class Handler(BaseHTTPRequestHandler):
                 report = {"kind": "image", **result}
             else:
                 dest = _tmp_path(tmpdir, f"out{Path(name).suffix}")
-                result = clean_container(src, dest, also_layer_a_text=bool(options.get("also_layer_a_text", True)))
+                result = clean_container(
+                    src, dest, also_layer_a_text=bool(options.get("also_layer_a_text", True))
+                )
                 cleaned_bytes = dest.read_bytes()
                 report = {"kind": "container", **result}
             report.pop("input", None)
@@ -488,7 +523,9 @@ def main() -> int:
     global API_KEY  # noqa: PLW0603 — CLI overrides env
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--host", default=os.environ.get("WATERMARKS_SERVER_HOST", "127.0.0.1"))
-    p.add_argument("--port", type=int, default=int(os.environ.get("WATERMARKS_SERVER_PORT", "8765")))
+    p.add_argument(
+        "--port", type=int, default=int(os.environ.get("WATERMARKS_SERVER_PORT", "8765"))
+    )
     p.add_argument("--api-key", default=API_KEY, help="require this bearer token (default: none)")
     p.add_argument("-V", "--version", action="store_true", help="print version and exit")
     args = p.parse_args()

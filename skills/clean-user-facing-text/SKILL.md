@@ -58,7 +58,7 @@ When prose and code are mixed, rewrite prose only. Never rename variables, alter
 When the user asks for an audit, distinguish:
 
 - **Verifiable:** Unicode characters removed or replaced, with script counts.
-- **Best-effort:** prose was rewritten to alter token and syntax patterns.
+- **Best-effort:** prose rewritten to alter token and syntax patterns.
 - **Not established:** official detector evasion, human authorship, or removal of a vendor's secret-key watermark.
 
 For technical background, read `references/watermark-notes.md`. For misuse or disclosure questions, read `references/responsible-use.md`.

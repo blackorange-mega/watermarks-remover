@@ -14,12 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import audit_website  # noqa: E402
-from audit_lib import aggregate, is_actionable, scan_file  # noqa: E402
-from audit_website import guess_kind, inspect_remote, parse_sitemap  # noqa: E402
-from common import classify_finding_confidence  # noqa: E402
-from container_meta import inspect_container  # noqa: E402
-from text_unicode import inspect_text  # noqa: E402
+import audit_website
+from audit_lib import aggregate, is_actionable, scan_file
+from audit_website import guess_kind, inspect_remote, parse_sitemap
+from common import classify_finding_confidence
+from container_meta import inspect_container
+from text_unicode import inspect_text
 
 
 def test_classify_finding_confidence_buckets():
@@ -31,7 +31,7 @@ def test_classify_finding_confidence_buckets():
         "pdf-structured:ai:AIGC": "probable",
         "PNG tEXt: c2pa, contentcredentials": "probable",
         "frontmatter key: generator": "probable",
-        "info: cms generator: <meta name=\"generator\" content=\"WordPress\">": "informational",
+        'info: cms generator: <meta name="generator" content="WordPress">': "informational",
         "customXml parts: 1": "informational",
         "unsupported container: woff2": "informational",
         "svg <metadata> present": "informational",
@@ -151,16 +151,13 @@ def test_aggregate_summary():
 def test_parse_sitemap_urlset_and_index():
     data = (
         b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        b'<url><loc>https://x.test/a</loc></url></urlset>'
+        b"<url><loc>https://x.test/a</loc></url></urlset>"
     )
     kind, urls = parse_sitemap(data)
     assert kind == "urlset"
     assert urls == ["https://x.test/a"]
 
-    idx = (
-        b'<sitemapindex><sitemap><loc>https://x.test/s1.xml</loc></sitemap>'
-        b"</sitemapindex>"
-    )
+    idx = b"<sitemapindex><sitemap><loc>https://x.test/s1.xml</loc></sitemap></sitemapindex>"
     assert parse_sitemap(idx) == ("sitemapindex", ["https://x.test/s1.xml"])
 
     assert parse_sitemap(gzip.compress(data))[0] == "urlset"
@@ -183,7 +180,6 @@ def test_inspect_remote_html_cms_informational():
     assert not is_actionable(result)
 
 
-
 def test_parse_sitemap_rejects_oversized_gzip(monkeypatch):
     monkeypatch.setattr(
         audit_website,
@@ -202,9 +198,7 @@ def test_parse_sitemap_rejects_oversized_gzip(monkeypatch):
 
 def test_validate_public_url_rejects_private_literal():
     with pytest.raises(ValueError, match="non-public address"):
-        audit_website._validate_public_http_url(
-            "http://127.0.0.1/secret"
-        )
+        audit_website._validate_public_http_url("http://127.0.0.1/secret")
 
 
 def test_validate_public_url_rejects_private_dns(monkeypatch):
@@ -226,9 +220,7 @@ def test_validate_public_url_rejects_private_dns(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="non-public address"):
-        audit_website._validate_public_http_url(
-            "https://example.com/page"
-        )
+        audit_website._validate_public_http_url("https://example.com/page")
 
 
 def test_validate_public_url_accepts_public_dns(monkeypatch):
@@ -249,9 +241,7 @@ def test_validate_public_url_accepts_public_dns(monkeypatch):
         fake_getaddrinfo,
     )
 
-    assert audit_website._validate_public_http_url(
-        "https://example.com/page"
-    ) == (
+    assert audit_website._validate_public_http_url("https://example.com/page") == (
         "https",
         "example.com",
         443,
@@ -278,9 +268,7 @@ def test_collect_urls_rejects_cross_origin_entry(monkeypatch):
         allowed_origin=None,
     ):
         return (
-            b"<urlset><url>"
-            b"<loc>http://127.0.0.1/secret</loc>"
-            b"</url></urlset>",
+            b"<urlset><url><loc>http://127.0.0.1/secret</loc></url></urlset>",
             "application/xml",
         )
 

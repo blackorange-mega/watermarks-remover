@@ -10,8 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import backup_path, cleaned_path, eprint, read_text_input, write_text_output  # noqa: E402
-from text_unicode import clean_text  # noqa: E402
+from common import (
+    backup_path,
+    cleaned_path,
+    eprint,
+    read_text_input,
+    write_text_output,
+)
+from text_unicode import clean_text
 
 
 def main() -> int:
@@ -69,7 +75,7 @@ def main() -> int:
             eprint("--in-place requires a file path")
             return 2
         src = Path(args.path)
-        bak = backup_path(src)
+        backup_path(src)  # side effect: keep a .bak of the original before overwriting
         out = str(src)
     elif out is None and args.path not in (None, "-"):
         out = str(cleaned_path(Path(args.path)))

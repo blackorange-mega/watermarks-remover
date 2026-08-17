@@ -7,14 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "service" / "scripts"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from audit_lib import scan_file  # noqa: E402
-from score_stylometry import (  # noqa: E402
+from audit_lib import scan_file
+from score_stylometry import (
     compute_burstiness,
     compute_mattr,
     extract_sentences,
@@ -22,11 +20,13 @@ from score_stylometry import (  # noqa: E402
     scan_ai_phrases,
     score_text_stylometry,
 )
-from server import capabilities  # noqa: E402
+from server import capabilities
 
 
 def test_sentence_and_word_extraction():
-    sample = "Hello world! This is a test. Here is a code block:\n```python\nprint('hi')\n```\nDone."
+    sample = (
+        "Hello world! This is a test. Here is a code block:\n```python\nprint('hi')\n```\nDone."
+    )
     sentences = extract_sentences(sample)
     assert len(sentences) == 4
     assert sentences[0] == "Hello world!"
@@ -46,7 +46,11 @@ def test_burstiness_variance():
     assert compute_burstiness(["Only one sentence here."])[1] == 0.0
 
     # Uniform sentences (every sentence is 5 words) -> CV should be 0.0
-    uniform = ["One two three four five.", "Six seven eight nine ten.", "Alpha beta gamma delta epsilon."]
+    uniform = [
+        "One two three four five.",
+        "Six seven eight nine ten.",
+        "Alpha beta gamma delta epsilon.",
+    ]
     mean, std, cv = compute_burstiness(uniform)
     assert mean == 5.0
     assert std == 0.0
@@ -124,6 +128,7 @@ def test_score_stylometry_cli():
         [sys.executable, str(script), str(ai_path), "--json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert res_ai.returncode == 1
     data_ai = json.loads(res_ai.stdout)
@@ -135,6 +140,7 @@ def test_score_stylometry_cli():
         [sys.executable, str(script), str(human_path), "--json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert res_human.returncode == 0
     data_human = json.loads(res_human.stdout)
@@ -145,6 +151,7 @@ def test_score_stylometry_cli():
         [sys.executable, str(script), str(ai_path), "--threshold", "0.99"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert res_thresh.returncode == 0
 
@@ -157,6 +164,7 @@ def test_inspect_text_stylometry_flag():
         [sys.executable, str(script), str(ai_path), "--stylometry", "--json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert res.returncode == 1
     data = json.loads(res.stdout)

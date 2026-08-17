@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from common import guard_binary, looks_binary  # noqa: E402
+from common import guard_binary, looks_binary
 
 DOCX_XML = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -38,10 +38,12 @@ def run(script: str, *args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
 
 # --- looks_binary ----------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "data,expected_fragment",
@@ -67,8 +69,8 @@ def test_flags_binary(data, expected_fragment):
         b"",
         b"Just some prose.\n",
         b"# Markdown\n\n- bullet\n",
-        "Accented prose: naïve café résumé\n".encode("utf-8"),
-        "Zero width​ and nbsp here\n".encode("utf-8"),
+        "Accented prose: naïve café résumé\n".encode(),
+        "Zero width​ and nbsp here\n".encode(),
         b"Latin-1 bytes: caf\xe9 na\xefve\n",  # not UTF-8, still text
         b"a\tb\r\nc\x0cd\x1b[0m\n",  # tabs, CRLF, form feed, ANSI escape
     ],
@@ -90,6 +92,7 @@ def test_guard_binary_can_be_overridden():
 
 
 # --- CLI behaviour ---------------------------------------------------------
+
 
 def test_inspect_text_refuses_docx(tmp_path):
     docx = make_docx(tmp_path / "doc.docx")
@@ -209,6 +212,7 @@ def test_stdin_binary_is_refused():
         input=docx.getvalue(),
         capture_output=True,
         timeout=60,
+        check=False,
     )
     assert r.returncode == 2
     assert b"looks like" in r.stderr
@@ -237,6 +241,7 @@ def test_stdin_non_ascii_magic_is_refused_whatever_the_codec(data, label, io_enc
         capture_output=True,
         timeout=60,
         env=env,
+        check=False,
     )
     assert r.returncode == 2, (label, io_encoding, r.stderr)
     assert label.encode() in r.stderr, (label, io_encoding, r.stderr)
@@ -245,9 +250,10 @@ def test_stdin_non_ascii_magic_is_refused_whatever_the_codec(data, label, io_enc
 def test_stdin_text_still_flows_through():
     r = subprocess.run(
         [sys.executable, str(SCRIPTS / "clean_text.py")],
-        input="plain​text\n".encode("utf-8"),
+        input="plain​text\n".encode(),
         capture_output=True,
         timeout=60,
+        check=False,
     )
     assert r.returncode == 0, r.stderr
     assert r.stdout.replace(b"\r\n", b"\n") == b"plaintext\n"

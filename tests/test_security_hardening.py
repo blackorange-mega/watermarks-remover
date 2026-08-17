@@ -14,15 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import common  # noqa: E402
-from common import (  # noqa: E402
+import common
+from common import (
     backup_path,
     read_text_input,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
 )
-from container_meta import (  # noqa: E402
+from container_meta import (
     MAX_ZIP_DECOMPRESSED_BYTES,
     _check_zip_budget,
     inspect_docx,

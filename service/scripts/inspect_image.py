@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect PNG/JPEG/WebP for C2PA and AI-related metadata."""
+"""Inspect raster images (PNG/JPEG/WebP/AVIF/HEIC/BMP/GIF/TIFF) for C2PA and AI-related metadata."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import classify_finding_confidence, emit_json  # noqa: E402
-from image_meta import inspect_image  # noqa: E402
+from common import classify_finding_confidence, emit_json
+from image_meta import inspect_image
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("path", type=Path, help="Image path (PNG, JPEG, or WebP)")
+    p.add_argument("path", type=Path, help="Image path (PNG/JPEG/WebP/AVIF/HEIC/BMP/GIF/TIFF)")
     p.add_argument("--json", action="store_true")
     p.add_argument(
         "--synthid-dir",

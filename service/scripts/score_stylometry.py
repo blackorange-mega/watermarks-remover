@@ -15,10 +15,8 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import re
 import sys
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,11 +26,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common import (  # noqa: E402
-    MAX_INPUT_BYTES,
     classify_finding_confidence,
     emit_json,
-    eprint,
-    looks_binary,
     read_text_input,
 )
 
@@ -48,14 +43,46 @@ AI_PHRASE_PATTERNS: tuple[tuple[str, str, float], ...] = (
     (r"\ba\s+testament\s+to\b", "a testament to", 1.1),
     (r"\brich\s+tapestry(?:\s+of)?\b", "rich tapestry", 1.3),
     (r"\bplays?\s+a\s+(?:pivotal|crucial|vital|key)\s+role\b", "plays a pivotal/crucial role", 1.0),
-    (r"\bin\s+(?:today'?s|the)\s+(?:(?:fast-paced|ever-evolving|digital|rapidly\s+changing)\s+)*(?:world|landscape|era|environment)\b", "in today's fast-paced world/landscape", 1.4),
-    (r"\bit\s+is\s+(?:important|essential|crucial|worth\s+noting)\s+to\s+(?:note|remember|consider|highlight)\b", "it is important/crucial to note", 0.9),
-    (r"\bnot\s+only\b[\w\s,]+\bbut\s+(?:also\s+)?(?:serves\s+to|acts\s+as|highlights)\b", "not only ... but also serves to", 0.8),
-    (r"\bserve(?:s|d)?\s+as\s+a\s+(?:beacon|reminder|catalyst|cornerstone)\b", "serves as a beacon/catalyst/cornerstone", 1.1),
-    (r"\bunderscore(?:s|d)?\s+the\s+(?:importance|need|significance)\b", "underscores the importance/need", 0.9),
-    (r"\bfoster(?:s|ing|ed)?\s+a\s+(?:sense|culture|deeper\s+understanding)\b", "fosters a sense/culture", 0.9),
-    (r"\bseamlessly\s+(?:integrates?|integrated|blends?|combine[sd]?)\b", "seamlessly integrates/blends", 1.0),
-    (r"\bnavigat(?:e|ing|es|ed)\s+the\s+(?:complexities|intricacies|nuances)\b", "navigating the complexities/nuances", 1.0),
+    (
+        r"\bin\s+(?:today'?s|the)\s+(?:(?:fast-paced|ever-evolving|digital|rapidly\s+changing)\s+)*(?:world|landscape|era|environment)\b",
+        "in today's fast-paced world/landscape",
+        1.4,
+    ),
+    (
+        r"\bit\s+is\s+(?:important|essential|crucial|worth\s+noting)\s+to\s+(?:note|remember|consider|highlight)\b",
+        "it is important/crucial to note",
+        0.9,
+    ),
+    (
+        r"\bnot\s+only\b[\w\s,]+\bbut\s+(?:also\s+)?(?:serves\s+to|acts\s+as|highlights)\b",
+        "not only ... but also serves to",
+        0.8,
+    ),
+    (
+        r"\bserve(?:s|d)?\s+as\s+a\s+(?:beacon|reminder|catalyst|cornerstone)\b",
+        "serves as a beacon/catalyst/cornerstone",
+        1.1,
+    ),
+    (
+        r"\bunderscore(?:s|d)?\s+the\s+(?:importance|need|significance)\b",
+        "underscores the importance/need",
+        0.9,
+    ),
+    (
+        r"\bfoster(?:s|ing|ed)?\s+a\s+(?:sense|culture|deeper\s+understanding)\b",
+        "fosters a sense/culture",
+        0.9,
+    ),
+    (
+        r"\bseamlessly\s+(?:integrates?|integrated|blends?|combine[sd]?)\b",
+        "seamlessly integrates/blends",
+        1.0,
+    ),
+    (
+        r"\bnavigat(?:e|ing|es|ed)\s+the\s+(?:complexities|intricacies|nuances)\b",
+        "navigating the complexities/nuances",
+        1.0,
+    ),
     (r"\bmultifaceted\s+(?:nature|approach|landscape)\b", "multifaceted nature/approach", 1.0),
     (r"\bharness(?:ing|ed|es)?\s+the\s+power\s+of\b", "harnessing the power of", 1.0),
     (r"\ba\s+myriad\s+of\b", "a myriad of", 0.8),
@@ -118,9 +145,7 @@ class StylometryReport:
             "confidence_level": self.confidence_level,
             "status": self.status,
             "findings": self.findings,
-            "findings_confidence": [
-                classify_finding_confidence(f) for f in self.findings
-            ],
+            "findings_confidence": [classify_finding_confidence(f) for f in self.findings],
             "notes": self.notes,
         }
 
@@ -285,19 +310,18 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
         ngram_score = 0.0
 
     # Lexical uniformity subscore: LLMs cluster tightly around MATTR 0.65-0.78 for 50-word windows
-    if 0.68 <= mattr <= 0.76:
-        diversity_score = 0.40
-    else:
-        diversity_score = 0.10
+    diversity_score = 0.4 if 0.68 <= mattr <= 0.76 else 0.1
 
     # 4. Composite Scoring & Small-Sample Dampening
     raw_composite = (burstiness_score * 0.45) + (ngram_score * 0.45) + (diversity_score * 0.10)
 
     # Dampening factor: scales smoothly from 0.4 at MIN_SAMPLE_WORDS up to 1.0 at FULL_WEIGHT_WORDS
     if word_count < FULL_WEIGHT_WORDS:
-        dampener = 0.4 + 0.6 * ((word_count - MIN_SAMPLE_WORDS) / (FULL_WEIGHT_WORDS - MIN_SAMPLE_WORDS))
+        dampener = 0.4 + 0.6 * (
+            (word_count - MIN_SAMPLE_WORDS) / (FULL_WEIGHT_WORDS - MIN_SAMPLE_WORDS)
+        )
         notes.append(
-            f"Sample word count ({word_count}) is in calibration range ({MIN_SAMPLE_WORDS}–{FULL_WEIGHT_WORDS}); score dampened by factor {dampener:.2f}"
+            f"Sample word count ({word_count}) is in calibration range ({MIN_SAMPLE_WORDS}-{FULL_WEIGHT_WORDS}); score dampened by factor {dampener:.2f}"
         )
     else:
         dampener = 1.0
@@ -362,7 +386,7 @@ def print_human_stylometry_report(report: StylometryReport, explain: bool = Fals
         for m in report.matched_markers:
             print(f"  * {m['phrase']} (occurrences: {m['count']}, weight: {m['weight']})")
             if m.get("samples"):
-                print(f"    sample: \"{m['samples'][0]}\"")
+                print(f'    sample: "{m["samples"][0]}"')
 
     if report.notes:
         print("\nNotes:")
@@ -376,9 +400,16 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("path", nargs="?", default="-", help="Text file to score ('-' for stdin)")
-    p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Score threshold to trigger exit code 1 (default: {DEFAULT_THRESHOLD})")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"Score threshold to trigger exit code 1 (default: {DEFAULT_THRESHOLD})",
+    )
     p.add_argument("--json", action="store_true", help="Emit JSON output")
-    p.add_argument("--explain", action="store_true", help="Include detailed matched phrase breakdown")
+    p.add_argument(
+        "--explain", action="store_true", help="Include detailed matched phrase breakdown"
+    )
 
     args = p.parse_args()
 

@@ -51,7 +51,11 @@ SYNTHID_CONFIG = '{"algorithm_name": "SynthID", "threshold": 0.52, "detector_typ
 
 
 def _fake_auto_watermark(*, fail_detect: bool = False, fail_generate: bool = False) -> str:
-    detect_body = 'raise RuntimeError("boom")' if fail_detect else 'return {"is_watermarked": True, "score": 3.5}'
+    detect_body = (
+        'raise RuntimeError("boom")'
+        if fail_detect
+        else 'return {"is_watermarked": True, "score": 3.5}'
+    )
     gen_body = 'raise RuntimeError("boom")' if fail_generate else "return 'WATERMARKED SAMPLE'"
     return (
         "class _WM:\n"
@@ -90,9 +94,8 @@ def _make_fake_upstream(
         watermark.mkdir(parents=True)
         (watermark / "__init__.py").write_text("")
         (watermark / "auto_watermark.py").write_text(
-            "from types import SimpleNamespace\n" + _fake_auto_watermark(
-                fail_detect=fail_detect, fail_generate=fail_generate
-            )
+            "from types import SimpleNamespace\n"
+            + _fake_auto_watermark(fail_detect=fail_detect, fail_generate=fail_generate)
         )
     utils_dir = upstream / "utils"
     utils_dir.mkdir(parents=True)
@@ -112,6 +115,7 @@ def _run_adapter(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 
@@ -193,8 +197,15 @@ def test_cli_detect_json_success(tmp_path: Path):
     f = tmp_path / "t.txt"
     f.write_text("hello world")
     r = _run_adapter(
-        "detect", str(f), "--scheme", "kgw", "--upstream-dir", str(upstream),
-        "--device", "cpu", "--json",
+        "detect",
+        str(f),
+        "--scheme",
+        "kgw",
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 0, r.stderr
     payload = json.loads(r.stdout)
@@ -211,8 +222,15 @@ def test_cli_detect_synthid_alias(tmp_path: Path):
     f = tmp_path / "t.txt"
     f.write_text("hello world")
     r = _run_adapter(
-        "detect", str(f), "--scheme", "synthid-text", "--upstream-dir", str(upstream),
-        "--device", "cpu", "--json",
+        "detect",
+        str(f),
+        "--scheme",
+        "synthid-text",
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 0, r.stderr
     payload = json.loads(r.stdout)
@@ -225,8 +243,15 @@ def test_cli_detect_runtime_error(tmp_path: Path):
     f = tmp_path / "t.txt"
     f.write_text("hello world")
     r = _run_adapter(
-        "detect", str(f), "--scheme", "kgw", "--upstream-dir", str(upstream),
-        "--device", "cpu", "--json",
+        "detect",
+        str(f),
+        "--scheme",
+        "kgw",
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 1
     assert "boom" in (r.stderr or "")
@@ -237,8 +262,16 @@ def test_cli_detect_offline_flag(tmp_path: Path):
     f = tmp_path / "t.txt"
     f.write_text("hello world")
     r = _run_adapter(
-        "detect", str(f), "--scheme", "kgw", "--upstream-dir", str(upstream),
-        "--device", "cpu", "--json", "--offline",
+        "detect",
+        str(f),
+        "--scheme",
+        "kgw",
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
+        "--offline",
     )
     assert r.returncode == 0, r.stderr
     assert "local_files_only" in (r.stderr or "")
@@ -252,8 +285,14 @@ def test_cli_config_too_large(tmp_path: Path):
     f = tmp_path / "t.txt"
     f.write_text("hello world")
     r = _run_adapter(
-        "detect", str(f), "--scheme", "kgw", "--config", str(big),
-        "--upstream-dir", str(upstream),
+        "detect",
+        str(f),
+        "--scheme",
+        "kgw",
+        "--config",
+        str(big),
+        "--upstream-dir",
+        str(upstream),
     )
     assert r.returncode == 3
     assert "too large" in (r.stderr or "")
@@ -266,9 +305,19 @@ def test_cli_watermark_json_success(tmp_path: Path):
     wm_out = tmp_path / "wm.txt"
     uwm_out = tmp_path / "uwm.txt"
     r = _run_adapter(
-        "watermark", str(prompt), "--scheme", "kgw",
-        "-o", str(wm_out), "-o2", str(uwm_out),
-        "--upstream-dir", str(upstream), "--device", "cpu", "--json",
+        "watermark",
+        str(prompt),
+        "--scheme",
+        "kgw",
+        "-o",
+        str(wm_out),
+        "-o2",
+        str(uwm_out),
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 0, r.stderr
     payload = json.loads(r.stdout)
@@ -282,8 +331,15 @@ def test_cli_watermark_runtime_error(tmp_path: Path):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("write about capybaras")
     r = _run_adapter(
-        "watermark", str(prompt), "--scheme", "kgw",
-        "--upstream-dir", str(upstream), "--device", "cpu", "--json",
+        "watermark",
+        str(prompt),
+        "--scheme",
+        "kgw",
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 1
     assert "boom" in (r.stderr or "")
@@ -295,7 +351,11 @@ def test_rewrite_markllm_detect_missing_venv(tmp_path: Path):
     upstream = tmp_path / "MarkLLM"
     upstream.mkdir()
     result = rewrite_text._markllm_detect(
-        "hello", scheme="kgw", upstream_dir=str(upstream), model="x", timeout=5,
+        "hello",
+        scheme="kgw",
+        upstream_dir=str(upstream),
+        model="x",
+        timeout=5,
     )
     assert result["available"] is False
 
@@ -322,7 +382,11 @@ def test_rewrite_markllm_detect_parses_json(tmp_path: Path, monkeypatch: pytest.
 
     monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
     result = rewrite_text._markllm_detect(
-        "hello", scheme="kgw", upstream_dir=str(upstream), model="x", timeout=5,
+        "hello",
+        scheme="kgw",
+        upstream_dir=str(upstream),
+        model="x",
+        timeout=5,
     )
     assert result["available"] is True
     assert result["score"] == 2.0
@@ -347,7 +411,11 @@ def test_rewrite_markllm_detect_adapter_failure(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
     result = rewrite_text._markllm_detect(
-        "hello", scheme="kgw", upstream_dir=str(upstream), model="x", timeout=5,
+        "hello",
+        scheme="kgw",
+        upstream_dir=str(upstream),
+        model="x",
+        timeout=5,
     )
     assert result["available"] is False
     assert "deps missing" in result["error"]
@@ -371,7 +439,8 @@ def test_markllm_preexec_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_rewrite_markllm_detect_applies_rlimit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     import rewrite_text
 
@@ -387,13 +456,15 @@ def test_rewrite_markllm_detect_applies_rlimit(
 
     def fake_run(cmd, **kwargs):
         captured["preexec_fn"] = kwargs.get("preexec_fn")
-        return SimpleNamespace(
-            returncode=0, stdout='{"available": true}', stderr=""
-        )
+        return SimpleNamespace(returncode=0, stdout='{"available": true}', stderr="")
 
     monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
     result = rewrite_text._markllm_detect(
-        "hello", scheme="kgw", upstream_dir=str(upstream), model="x", timeout=5,
+        "hello",
+        scheme="kgw",
+        upstream_dir=str(upstream),
+        model="x",
+        timeout=5,
     )
     assert result["available"] is True
     assert callable(captured["preexec_fn"])
@@ -406,9 +477,7 @@ def test_rewrite_markllm_hook_records_before_after(tmp_path: Path, monkeypatch: 
         return {"available": True, "is_watermarked": text == "ORIG", "score": 3.0}
 
     monkeypatch.setattr(rewrite_text, "_markllm_detect", fake_detect)
-    monkeypatch.setattr(
-        rewrite_text, "call_ollama", lambda *a, **k: "REWRITTEN OUTPUT"
-    )
+    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "REWRITTEN OUTPUT")
     out, info = rewrite_text.rewrite(
         "ORIG",
         backend="ollama",
@@ -423,7 +492,7 @@ def test_rewrite_markllm_hook_records_before_after(tmp_path: Path, monkeypatch: 
         temperature=0.9,
         candidates=1,
         markllm_scheme="kgw",
-        markllm_dir="/tmp/x",
+        markllm_dir=str(tmp_path / "x"),
         markllm_model="opt-1.3b",
         markllm_timeout=5,
     )

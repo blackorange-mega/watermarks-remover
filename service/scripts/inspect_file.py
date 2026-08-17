@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified inspect: text, images (PNG/JPEG/WebP), and document containers."""
+"""Unified inspect: text, images, and document containers."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (  # noqa: E402
+from common import (
     MAX_INPUT_BYTES,
     ROUTER_ADVICE,
     classify_finding_confidence,
@@ -17,10 +17,10 @@ from common import (  # noqa: E402
     eprint,
     read_text_input,
 )
-from container_meta import inspect_container  # noqa: E402
-from format_dispatch import classify  # noqa: E402
-from image_meta import inspect_image  # noqa: E402
-from text_unicode import human_report, inspect_text  # noqa: E402
+from container_meta import inspect_container
+from format_dispatch import classify
+from image_meta import inspect_image
+from text_unicode import human_report, inspect_text
 
 
 def main() -> int:

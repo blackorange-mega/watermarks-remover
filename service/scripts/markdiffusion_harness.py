@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import os
 import sys
 from pathlib import Path
@@ -41,7 +40,7 @@ from typing import Any
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from common import eprint, emit_json, read_text_input, safe_write_bytes  # noqa: E402
+from common import emit_json, eprint, read_text_input, safe_write_bytes  # noqa: E402
 
 # User-facing scheme names -> MarkDiffusion algorithm names (image-only; the
 # video algorithms VideoShield/VideoMark are out of scope here). Canonical
@@ -93,7 +92,7 @@ def resolve_device(raw: str | None) -> str:
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
             return "mps"
-    except Exception:
+    except Exception:  # noqa: S110 - optional torch device detection
         pass
     return "cpu"
 
@@ -104,10 +103,7 @@ def normalize_scheme(raw: str) -> str:
         return up
     if raw.lower() in SCHEMES:
         return SCHEMES[raw.lower()]
-    raise ValueError(
-        f"unknown scheme {raw!r}; image schemes: "
-        + ", ".join(sorted(SCHEMES))
-    )
+    raise ValueError(f"unknown scheme {raw!r}; image schemes: " + ", ".join(sorted(SCHEMES)))
 
 
 def _import_markdiffusion(upstream: Path | None) -> Any:
@@ -118,8 +114,9 @@ def _import_markdiffusion(upstream: Path | None) -> Any:
         import markdiffusion
     except ImportError as e:
         raise _Unavailable(
-            "markdiffusion not importable: " + str(e) +
-            " (set MARKDIFFUSION_DIR / --upstream-dir to a checkout, or "
+            "markdiffusion not importable: "
+            + str(e)
+            + " (set MARKDIFFUSION_DIR / --upstream-dir to a checkout, or "
             "pip install markdiffusion[optional])"
         ) from e
     return markdiffusion
@@ -178,14 +175,14 @@ def _json_safe(obj: Any) -> Any:
 
         if isinstance(obj, np.generic):
             return obj.item()
-    except Exception:
+    except Exception:  # noqa: S110 - optional numpy import
         pass
     try:
         import torch
 
         if isinstance(obj, torch.Tensor):
             return obj.item()
-    except Exception:
+    except Exception:  # noqa: S110 - optional torch import
         pass
     try:
         return float(obj)
@@ -237,8 +234,8 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path | None, scheme: str)
 
     try:
         _import_markdiffusion(upstream)
-        from markdiffusion.watermark import AutoWatermark
         from markdiffusion.utils import DiffusionConfig
+        from markdiffusion.watermark import AutoWatermark
 
         pipe, scheduler = _load_diffusion(args.model, device, args.offline, args.size)
         diffusion_config = DiffusionConfig(
@@ -312,10 +309,9 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path | None, scheme: str) ->
 
     try:
         _import_markdiffusion(upstream)
-        from PIL import Image
-
-        from markdiffusion.watermark import AutoWatermark
         from markdiffusion.utils import DiffusionConfig
+        from markdiffusion.watermark import AutoWatermark
+        from PIL import Image
 
         pipe, scheduler = _load_diffusion(args.model, device, args.offline, args.size)
         diffusion_config = DiffusionConfig(
@@ -337,9 +333,7 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path | None, scheme: str) ->
         kwargs: dict[str, Any] = {}
         if args.detector_type:
             kwargs["detector_type"] = args.detector_type
-        result = wm.detect_watermark_in_media(
-            image, prompt=args.prompt or "", **kwargs
-        )
+        result = wm.detect_watermark_in_media(image, prompt=args.prompt or "", **kwargs)
         config_dict = getattr(getattr(wm, "config", None), "config_dict", None)
     except _Unavailable as e:
         eprint(str(e))
@@ -377,10 +371,9 @@ def _cmd_purify(args: argparse.Namespace, upstream: Path | None) -> int:
 
     try:
         _import_markdiffusion(upstream)
-        from PIL import Image
-
         from markdiffusion.evaluation.tools.image_editor import DiffusionPurification
         from markdiffusion.utils import DiffusionConfig
+        from PIL import Image
 
         pipe, scheduler = _load_diffusion(args.model, device, args.offline, args.size)
         diffusion_config = DiffusionConfig(
@@ -459,12 +452,21 @@ def main() -> int:
 
     wm = sub.add_parser("watermark", help="Generate a watermarked sample image")
     wm.add_argument("prompt", help="Prompt file, or - for stdin")
-    wm.add_argument("-o", "--watermarked-output", required=True,
-                    help="Output PNG path (images cannot go to stdout)")
-    wm.add_argument("-o2", "--unwatermarked-output", default=None,
-                    help="Also write an unwatermarked sample to this path")
-    wm.add_argument("--scheme", default="tr",
-                    help="Scheme: " + ", ".join(sorted(SCHEMES)) + " (default: tr)")
+    wm.add_argument(
+        "-o",
+        "--watermarked-output",
+        required=True,
+        help="Output PNG path (images cannot go to stdout)",
+    )
+    wm.add_argument(
+        "-o2",
+        "--unwatermarked-output",
+        default=None,
+        help="Also write an unwatermarked sample to this path",
+    )
+    wm.add_argument(
+        "--scheme", default="tr", help="Scheme: " + ", ".join(sorted(SCHEMES)) + " (default: tr)"
+    )
     wm.add_argument("--config", default=None, help="Algorithm config JSON (default: bundled)")
     wm.add_argument("--size", type=int, default=512, help="Image size in px (default: 512)")
     wm.add_argument("--steps", type=int, default=50, help="Diffusion steps (default: 50)")
@@ -476,12 +478,16 @@ def main() -> int:
 
     det = sub.add_parser("detect", help="Same-scheme detection on an image")
     det.add_argument("path", help="Image file to detect on")
-    det.add_argument("--scheme", default="tr",
-                    help="Scheme: " + ", ".join(sorted(SCHEMES)) + " (default: tr)")
+    det.add_argument(
+        "--scheme", default="tr", help="Scheme: " + ", ".join(sorted(SCHEMES)) + " (default: tr)"
+    )
     det.add_argument("--config", default=None, help="Algorithm config JSON (default: bundled)")
     det.add_argument("--prompt", default=None, help="Optional prompt used at generation")
-    det.add_argument("--detector-type", default=None,
-                     help="Detector variant (e.g. l1_distance, p_value; scheme-dependent)")
+    det.add_argument(
+        "--detector-type",
+        default=None,
+        help="Detector variant (e.g. l1_distance, p_value; scheme-dependent)",
+    )
     det.add_argument("--size", type=int, default=512, help="Image size in px (default: 512)")
     det.add_argument("--steps", type=int, default=50, help="Diffusion steps (default: 50)")
     det.add_argument("--guidance", type=float, default=7.5, help="Guidance scale (default: 7.5)")
@@ -493,9 +499,12 @@ def main() -> int:
     pf = sub.add_parser("purify", help="Run the DiffusionPurification regeneration attack")
     pf.add_argument("path", help="Image file to purify")
     pf.add_argument("-o", "--output", required=True, help="Output PNG path")
-    pf.add_argument("--purification-strength", type=float, default=0.3,
-                    help="Fraction of the diffusion schedule to regenerate in (0, 1] "
-                    "(default: 0.3)")
+    pf.add_argument(
+        "--purification-strength",
+        type=float,
+        default=0.3,
+        help="Fraction of the diffusion schedule to regenerate in (0, 1] (default: 0.3)",
+    )
     pf.add_argument("--prompt", default=None, help="Optional prompt for denoising (default: '')")
     pf.add_argument("--size", type=int, default=512, help="Image size in px (default: 512)")
     pf.add_argument("--steps", type=int, default=50, help="Diffusion steps (default: 50)")

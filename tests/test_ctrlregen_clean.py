@@ -17,12 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import image_meta  # noqa: E402
-from image_meta import run_ctrlregen_clean  # noqa: E402
+import image_meta
+from image_meta import run_ctrlregen_clean
 
 CLEAN_SCRIPT = SCRIPTS / "clean_ctrlregen.py"
 
-FAKE_PIL = '''\
+FAKE_PIL = """\
 class Image:
     def __init__(self, size=(10, 20)):
         self.size = size
@@ -35,7 +35,7 @@ class Image:
         return self
     def save(self, fp, format=None, **kwargs):
         fp.write(b"FAKEIMAGE")
-'''
+"""
 
 
 def _fake_engine(fail_run: bool) -> str:
@@ -73,6 +73,7 @@ def _run_adapter(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 
@@ -123,7 +124,14 @@ def test_cli_json_success(tmp_path: Path):
     img.write_bytes(b"x")
     out = tmp_path / "out.png"
     r = _run_adapter(
-        str(img), "-o", str(out), "--upstream-dir", str(upstream), "--device", "cpu", "--json",
+        str(img),
+        "-o",
+        str(out),
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 0, r.stderr
     payload = json.loads(r.stdout)
@@ -137,8 +145,14 @@ def test_cli_runtime_error(tmp_path: Path):
     img = tmp_path / "img.png"
     img.write_bytes(b"x")
     r = _run_adapter(
-        str(img), "-o", str(tmp_path / "out.png"), "--upstream-dir", str(upstream),
-        "--device", "cpu", "--json",
+        str(img),
+        "-o",
+        str(tmp_path / "out.png"),
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 1
     assert "model missing" in (r.stderr or "")
@@ -156,7 +170,14 @@ def test_cli_refuses_symlink_output(tmp_path: Path):
     except OSError:
         pytest.skip("symlinks unavailable")
     r = _run_adapter(
-        str(img), "-o", str(out), "--upstream-dir", str(upstream), "--device", "cpu", "--json",
+        str(img),
+        "-o",
+        str(out),
+        "--upstream-dir",
+        str(upstream),
+        "--device",
+        "cpu",
+        "--json",
     )
     assert r.returncode == 1
     assert victim.read_bytes() == b"original"
@@ -172,11 +193,12 @@ def test_run_ctrlregen_clean_unconfigured_returns_unavailable(
 
 
 def test_run_ctrlregen_clean_success_parses_json(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     upstream = tmp_path / "upstream"
     upstream.mkdir()
-    payload = {"available": True, "output": "/tmp/y.png", "device": "cpu"}
+    payload = {"available": True, "output": str(tmp_path / "y.png"), "device": "cpu"}
     captured: dict = {}
 
     def fake_run(cmd, **kwargs):
@@ -205,7 +227,8 @@ def test_run_ctrlregen_clean_success_parses_json(
 
 
 def test_run_ctrlregen_clean_unavailable_exit3(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     upstream = tmp_path / "upstream"
     upstream.mkdir()
@@ -220,7 +243,8 @@ def test_run_ctrlregen_clean_unavailable_exit3(
 
 
 def test_run_ctrlregen_clean_prefers_venv_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     upstream = tmp_path / "upstream"
     if os.name == "nt":
@@ -259,7 +283,7 @@ def test_clean_image_ctrlregen_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         src,
         dest,
         remove_pixel="ctrlregen",
-        ctrlregen_dir="/tmp/upstream",
+        ctrlregen_dir=str(tmp_path / "upstream"),
         ctrlregen_strength=0.3,
     )
 

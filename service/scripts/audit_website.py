@@ -26,8 +26,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from audit_lib import aggregate, print_human_report, scan_file  # noqa: E402
-from common import emit_json, eprint  # noqa: E402
+import contextlib
+
+from audit_lib import aggregate, print_human_report, scan_file
+from common import emit_json, eprint
 
 DEFAULT_MAX_BYTES = 4 << 20
 DEFAULT_TIMEOUT = 15
@@ -60,22 +62,24 @@ def parse_sitemap(data: bytes) -> tuple[str, list[str]]:
             data = stream.read(MAX_SITEMAP_DECOMPRESSED_BYTES + 1)
         if len(data) > MAX_SITEMAP_DECOMPRESSED_BYTES:
             raise ValueError(
-                "sitemap decompressed size exceeds cap "
-                f"({MAX_SITEMAP_DECOMPRESSED_BYTES} bytes)"
+                f"sitemap decompressed size exceeds cap ({MAX_SITEMAP_DECOMPRESSED_BYTES} bytes)"
             )
     elif len(data) > MAX_SITEMAP_DECOMPRESSED_BYTES:
-        raise ValueError(
-            "sitemap size exceeds cap "
-            f"({MAX_SITEMAP_DECOMPRESSED_BYTES} bytes)"
-        )
+        raise ValueError(f"sitemap size exceeds cap ({MAX_SITEMAP_DECOMPRESSED_BYTES} bytes)")
 
-    root = ET.fromstring(data)
+    # stdlib ElementTree does not expand external entities, but internal entity
+    # expansion (billion-laughs) is still possible; reject DTDs outright.
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise ValueError("sitemap declares a DTD / entities; refusing to parse")
+
+    root = ET.fromstring(data)  # noqa: S314 - DTD/entity declarations rejected above
     kind = _local(root.tag)
     urls = []
     for el in root.iter():
         if _local(el.tag) == "loc" and el.text:
             urls.append(el.text.strip())
     return kind, urls
+
 
 def guess_kind(url: str, data: bytes, content_type: str | None = None) -> str:
     """Classify a downloaded URL from headers, suffix, then magic bytes."""
@@ -222,10 +226,7 @@ def _validated_target(
     origin = _url_origin(url)
 
     if expected_origin is not None and not _origin_allowed(origin, expected_origin):
-        raise ValueError(
-            f"cross-origin URL is not allowed: "
-            f"{origin[0]}://{origin[1]}:{origin[2]}"
-        )
+        raise ValueError(f"cross-origin URL is not allowed: {origin[0]}://{origin[1]}:{origin[2]}")
 
     return origin, _resolve_public_addresses(origin)
 
@@ -257,10 +258,8 @@ def _open_pinned_connection(
             if scheme == "https":
                 context = ssl.create_default_context()
                 context.minimum_version = ssl.TLSVersion.TLSv1_2
-                try:
+                with contextlib.suppress(NotImplementedError):
                     context.set_alpn_protocols(["http/1.1"])
-                except NotImplementedError:
-                    pass
 
                 wrapped = context.wrap_socket(raw, server_hostname=host)
                 raw = None
@@ -282,10 +281,8 @@ def _open_pinned_connection(
         except OSError as exc:
             last_error = exc
             if raw is not None:
-                try:
+                with contextlib.suppress(OSError):
                     raw.close()
-                except OSError:
-                    pass
 
     if last_error is not None:
         raise last_error
@@ -395,7 +392,7 @@ def discover_sitemap(base_url: str, timeout: int) -> str | None:
             )
             parse_sitemap(data)
             return candidate
-        except Exception:
+        except Exception:  # noqa: S112 - try next candidate sitemap on any failure
             continue
 
     try:
@@ -414,16 +411,15 @@ def discover_sitemap(base_url: str, timeout: int) -> str | None:
                 candidate_origin = _url_origin(candidate)
 
                 if not _origin_allowed(candidate_origin, origin):
-                    raise ValueError(
-                        f"cross-origin sitemap is not allowed: {candidate}"
-                    )
+                    raise ValueError(f"cross-origin sitemap is not allowed: {candidate}")
 
                 return candidate
 
-    except Exception:
+    except Exception:  # noqa: S110 - robots.txt is optional; fall through to None
         pass
 
     return None
+
 
 def collect_urls(
     sitemap_url: str,
@@ -439,9 +435,7 @@ def collect_urls(
         candidate_origin = _url_origin(loc)
 
         if not _origin_allowed(candidate_origin, origin):
-            raise ValueError(
-                f"cross-origin sitemap URL is not allowed: {loc}"
-            )
+            raise ValueError(f"cross-origin sitemap URL is not allowed: {loc}")
 
     def _recurse(url: str, depth: int = 0) -> None:
         if len(urls) >= max_pages or depth > 3:
@@ -477,6 +471,7 @@ def collect_urls(
 
     _recurse(sitemap_url)
     return urls
+
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)

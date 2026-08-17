@@ -11,10 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from image_meta import (  # noqa: E402
+from image_meta import (
     clean_image,
     detect_format,
-    inspect_image,
     inspect_webp,
     strip_jpeg,
     strip_png,
@@ -63,9 +62,7 @@ def _webp_chunk(fourcc: bytes, payload: bytes) -> bytes:
 
 
 def _minimal_webp(*chunks: tuple[bytes, bytes]) -> bytes:
-    body = b"WEBP" + b"".join(
-        _webp_chunk(fourcc, payload) for fourcc, payload in chunks
-    )
+    body = b"WEBP" + b"".join(_webp_chunk(fourcc, payload) for fourcc, payload in chunks)
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 

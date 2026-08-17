@@ -1,21 +1,42 @@
-"""Detect and strip C2PA / AI-related metadata from PNG, JPEG, and WebP (stdlib)."""
+"""Detect and strip C2PA / AI-related metadata from raster images (stdlib).
+
+Supported formats: PNG, JPEG, WebP, AVIF/HEIC (ISOBMFF), BMP, GIF, and TIFF
+(classic and BigTIFF).
+"""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import struct
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from common import classify_finding_confidence, safe_arg, safe_write_bytes, subprocess_preexec_fn, which
+from common import (
+    classify_finding_confidence,
+    safe_arg,
+    safe_write_bytes,
+    subprocess_preexec_fn,
+    which,
+)
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+
+# Optional HTTP SynthID scorer sidecar (synthid_score_server.py). When
+# WATERMARKS_SYNTHID_SCORER_URL is set, run_synthid_score calls the sidecar
+# instead of a local reverse-SynthID checkout — this keeps the published core
+# image free of the non-commercial upstream code. Read per call so tests can
+# set the env vars after import.
+DEFAULT_SYNTHID_SCORER_TIMEOUT = 60.0
 
 # CtrlRegen is torch-based and needs far more address space than the stdlib
 # parsers. The invoking clean_image.py subprocess applies these higher,
@@ -30,7 +51,9 @@ def ctrlregen_preexec_fn() -> None:
         import resource
 
         resource.setrlimit(resource.RLIMIT_AS, (_CTRLREGEN_RLIMIT_AS, _CTRLREGEN_RLIMIT_AS))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (_CTRLREGEN_RLIMIT_FSIZE, _CTRLREGEN_RLIMIT_FSIZE))
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE, (_CTRLREGEN_RLIMIT_FSIZE, _CTRLREGEN_RLIMIT_FSIZE)
+        )
     except (ImportError, OSError, ValueError):
         pass
 
@@ -41,6 +64,12 @@ PNG_SIG = b"\x89PNG\r\n\x1a\n"
 JPEG_SOI = b"\xff\xd8"
 WEBP_RIFF = b"RIFF"
 WEBP_SIG = b"WEBP"
+BMP_SIG = b"BM"
+GIF_SIGS = (b"GIF87a", b"GIF89a")
+TIFF_LE_SIG = b"II*\x00"
+TIFF_BE_SIG = b"MM\x00*"
+TIFF_LE_BIG_SIG = b"II+\x00"
+TIFF_BE_BIG_SIG = b"MM\x00+"
 
 # Chunk types / content patterns associated with C2PA / AI provenance
 C2PA_MARKERS = (
@@ -79,7 +108,7 @@ AI_META_HINTS = (
 @dataclass
 class ImageInspectReport:
     path: str
-    format: str  # png | jpeg | webp | unknown
+    format: str  # png | jpeg | webp | avif | heic | bmp | gif | tiff | unknown
     has_c2pa: bool
     has_ai_metadata: bool
     findings: list[str] = field(default_factory=list)
@@ -94,9 +123,7 @@ class ImageInspectReport:
             "has_c2pa": self.has_c2pa,
             "has_ai_metadata": self.has_ai_metadata,
             "findings": self.findings,
-            "findings_confidence": [
-                classify_finding_confidence(f) for f in self.findings
-            ],
+            "findings_confidence": [classify_finding_confidence(f) for f in self.findings],
             "tools": self.tools,
             "synthid": self.synthid,
             "notes": self.notes,
@@ -113,9 +140,9 @@ def detect_format(data: bytes) -> str:
     if len(data) >= 12 and data[4:8] == b"ftyp":
         box_size = struct.unpack(">I", data[0:4])[0]
         header_chunk = (
-            data[8:min(box_size, len(data), 64)]
+            data[8 : min(box_size, len(data), 64)]
             if box_size >= 8
-            else data[8:min(len(data), 64)]
+            else data[8 : min(len(data), 64)]
         )
         if any(b in header_chunk for b in (b"avif", b"avis", b"avio")):
             return "avif"
@@ -124,6 +151,12 @@ def detect_format(data: bytes) -> str:
             for b in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1", b"heif")
         ):
             return "heic"
+    if data[:2] == BMP_SIG:
+        return "bmp"
+    if data[:6] in GIF_SIGS:
+        return "gif"
+    if data[:4] in (TIFF_LE_SIG, TIFF_BE_SIG, TIFF_LE_BIG_SIG, TIFF_BE_BIG_SIG):
+        return "tiff"
     return "unknown"
 
 
@@ -221,8 +254,7 @@ def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
             if hits:
                 has_ai = True
                 if any(
-                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth")
-                    for h in hits
+                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth") for h in hits
                 ):
                     has_c2pa = True
                 findings.append(f"JPEG APP{marker - 0xE0}: {', '.join(hits[:8])}")
@@ -241,9 +273,7 @@ def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], list[st
     notes: list[str] = []
     declared_size = struct.unpack("<I", data[4:8])[0]
     if declared_size + 8 != len(data):
-        notes.append(
-            f"RIFF size mismatch: header={declared_size + 8} actual={len(data)}"
-        )
+        notes.append(f"RIFF size mismatch: header={declared_size + 8} actual={len(data)}")
 
     chunks: list[tuple[bytes, bytes, bytes]] = []
     pos = 12
@@ -257,9 +287,7 @@ def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], list[st
             name = fourcc.decode("latin-1", errors="replace")
             notes.append(f"truncated WebP chunk {name}")
             break
-        chunks.append(
-            (fourcc, data[payload_start:payload_end], data[payload_end:padded_end])
-        )
+        chunks.append((fourcc, data[payload_start:payload_end], data[payload_end:padded_end]))
         pos = padded_end
     if pos != len(data) and not any("truncated" in note for note in notes):
         notes.append(f"trailing WebP bytes: {len(data) - pos}")
@@ -351,8 +379,7 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                 else:
                     findings.append(f"{fmt.upper()} XMP uuid box")
                 if any(
-                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth")
-                    for h in hits
+                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth") for h in hits
                 ):
                     has_c2pa = True
             else:
@@ -360,10 +387,7 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                 if hits:
                     has_ai = True
                     findings.append(f"{fmt.upper()} uuid box: {', '.join(hits[:8])}")
-                    if any(
-                        h.lower() in ("c2pa", "contentcredentials", "jumb")
-                        for h in hits
-                    ):
+                    if any(h.lower() in ("c2pa", "contentcredentials", "jumb") for h in hits):
                         has_c2pa = True
         elif fourcc == b"meta":
             meta_sub = _parse_isobmff_boxes(payload, start=4)
@@ -371,25 +395,16 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                 s_name = s_fourcc.decode("latin-1", errors="replace")
                 if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
                     has_c2pa = True
-                    findings.append(
-                        f"{fmt.upper()} meta sub-box {s_name} (C2PA/JUMBF container)"
-                    )
+                    findings.append(f"{fmt.upper()} meta sub-box {s_name} (C2PA/JUMBF container)")
                 elif s_fourcc == b"uuid":
                     if s_payload.startswith(XMP_UUID):
                         has_ai = True
-                        hits = _contains_any(
-                            s_payload[16:], AI_META_HINTS + C2PA_MARKERS
-                        )
+                        hits = _contains_any(s_payload[16:], AI_META_HINTS + C2PA_MARKERS)
                         if hits:
-                            findings.append(
-                                f"{fmt.upper()} meta XMP uuid: {', '.join(hits[:8])}"
-                            )
+                            findings.append(f"{fmt.upper()} meta XMP uuid: {', '.join(hits[:8])}")
                         else:
                             findings.append(f"{fmt.upper()} meta XMP uuid box")
-                        if any(
-                            h.lower() in ("c2pa", "contentcredentials", "jumb")
-                            for h in hits
-                        ):
+                        if any(h.lower() in ("c2pa", "contentcredentials", "jumb") for h in hits):
                             has_c2pa = True
                     else:
                         hits = _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS)
@@ -400,14 +415,9 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                     hits = _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS)
                     if hits:
                         has_ai = True
-                        if any(
-                            h.lower() in ("c2pa", "contentcredentials", "jumb")
-                            for h in hits
-                        ):
+                        if any(h.lower() in ("c2pa", "contentcredentials", "jumb") for h in hits):
                             has_c2pa = True
-                        findings.append(
-                            f"{fmt.upper()} meta/{s_name}: {', '.join(hits[:8])}"
-                        )
+                        findings.append(f"{fmt.upper()} meta/{s_name}: {', '.join(hits[:8])}")
 
     whole = _contains_any(data, C2PA_MARKERS)
     if whole and not has_c2pa:
@@ -415,6 +425,718 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
         findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
 
     return has_c2pa, has_ai or has_c2pa, findings
+
+
+# ---------------------------------------------------------------------------
+# BMP
+# ---------------------------------------------------------------------------
+
+
+def _bmp_payload_extent(data: bytes) -> tuple[int, int] | None:
+    """Return (pixel_offset, pixel_size) for a BMP, or None.
+
+    Locates the true image payload by parsing the BITMAPFILEHEADER and the DIB
+    header (BITMAPINFOHEADER 40, V4 108, or V5 124 bytes), so trailing
+    non-image bytes can be told apart from pixel data. Uncompressed rows are
+    padded to 4-byte boundaries; compressed or embedded-image BMPs (RLE, JPEG,
+    PNG) rely on the declared biSizeImage, and anything unparseable returns
+    None so callers stay conservative.
+    """
+    if len(data) < 30 or data[:2] != BMP_SIG:
+        return None
+    pixel_offset = struct.unpack("<I", data[10:14])[0]
+    dib_size = struct.unpack("<I", data[14:18])[0]
+    if dib_size < 40 or 14 + dib_size > len(data):
+        return None
+    width = struct.unpack("<i", data[18:22])[0]
+    height = struct.unpack("<i", data[22:26])[0]
+    bpp = struct.unpack("<H", data[28:30])[0]
+    compression = struct.unpack("<I", data[30:34])[0]
+    size_image = struct.unpack("<I", data[34:38])[0]
+    if width <= 0 or bpp == 0 or pixel_offset > len(data):
+        return None
+    if compression == 0:  # BI_RGB
+        row_size = ((width * bpp + 31) // 32) * 4
+        size = row_size * abs(height)
+    elif size_image:
+        size = size_image
+    else:
+        return None
+    return pixel_offset, size
+
+
+def _bmp_trailing(data: bytes) -> bytes:
+    """Bytes after the image payload, which is where non-standard BMP metadata lives."""
+    extent = _bmp_payload_extent(data)
+    if extent is None:
+        return b""
+    pixel_offset, size = extent
+    end = pixel_offset + size
+    return data[end:] if end < len(data) else b""
+
+
+def inspect_bmp(data: bytes) -> tuple[bool, bool, list[str]]:
+    """Inspect a BMP for trailing (non-standard) metadata.
+
+    BMP has no standardized metadata container; the only realistic place
+    provenance data can live is after the image payload. Pixel bytes are never
+    scanned, so compressed/embedded-image data cannot false-positive.
+    """
+    findings: list[str] = []
+    if len(data) < 14 or data[:2] != BMP_SIG:
+        return False, False, ["not a BMP"]
+    trailing = _bmp_trailing(data)
+    has_c2pa = False
+    has_ai = False
+    if trailing:
+        hits = _contains_any(trailing, AI_META_HINTS + C2PA_MARKERS)
+        if hits:
+            has_ai = True
+            if any(
+                h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth") for h in hits
+            ):
+                has_c2pa = True
+            findings.append(f"BMP trailing metadata: {', '.join(hits[:6])}")
+        else:
+            findings.append(f"BMP has {len(trailing)} unrecognized trailing byte(s)")
+    else:
+        findings.append("BMP has no metadata (header-only raster format)")
+    return has_c2pa, has_ai or has_c2pa, findings
+
+
+def strip_bmp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
+    """Strip trailing non-image bytes from a BMP and fix the file-size field.
+
+    The pixel payload is located via the DIB header and left byte-identical;
+    anything after it is treated as metadata. The 4-byte file-size field at
+    offset 2 is rewritten to the truncated length.
+    """
+    if len(data) < 14 or data[:2] != BMP_SIG:
+        raise ValueError("not BMP")
+    extent = _bmp_payload_extent(data)
+    if extent is None:
+        return data, ["BMP header not fully parsed; left unchanged"]
+    pixel_offset, size = extent
+    end = pixel_offset + size
+    if end >= len(data):
+        return data, ["no BMP trailing metadata to strip"]
+    trailing = data[end:]
+    hits = _contains_any(trailing, AI_META_HINTS + C2PA_MARKERS)
+    if not strip_all_metadata and not hits:
+        return data, ["BMP trailing bytes kept (keep-non-ai-metadata)"]
+    out = bytearray(data[:end])
+    out[2:6] = struct.pack("<I", end)
+    reason = f" ({', '.join(hits[:4])})" if hits else ""
+    return bytes(out), [f"drop {len(trailing)} BMP trailing byte(s){reason}"]
+
+
+# ---------------------------------------------------------------------------
+# GIF
+# ---------------------------------------------------------------------------
+
+
+def _gif_extension_info(data: bytes, start: int, n: int) -> tuple[int, int, bytes] | None:
+    """Return (end, label, payload) for the extension block at *start* (0x21).
+
+    The payload is the concatenation of all sub-blocks after the label; *end*
+    is the offset just past the terminating 0x00.
+    """
+    if start + 2 > n:
+        return None
+    label = data[start + 1]
+    pos = start + 2
+    payload = bytearray()
+    while pos < n:
+        size = data[pos]
+        pos += 1
+        if size == 0:
+            return pos, label, bytes(payload)
+        if pos + size > n:
+            return None
+        payload.extend(data[pos : pos + size])
+        pos += size
+    return None
+
+
+def _gif_image_end(data: bytes, start: int, n: int) -> int | None:
+    """Return the offset just past the image block starting at *start* (0x2C)."""
+    pos = start + 1
+    if pos + 9 > n:
+        return None
+    packed = data[pos + 8]
+    pos += 9
+    if packed & 0x80:  # local color table present
+        pos += 3 * (1 << ((packed & 0x07) + 1))
+    if pos >= n:
+        return None
+    pos += 1  # LZW minimum code size
+    while pos < n:
+        size = data[pos]
+        pos += 1
+        if size == 0:
+            return pos
+        if pos + size > n:
+            return None
+        pos += size
+    return None
+
+
+GIF_XMP_APPLICATION_ID = b"XMP DataXMP"
+# Application extensions that control rendering rather than carrying provenance;
+# dropping them would change animation looping or color, so they are kept.
+_GIF_CONTROL_APPLICATION_IDS = (b"NETSCAPE2.0", b"ICCRGBG1012")
+
+
+def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
+    """Inspect GIF comment / application extensions and XMP payloads."""
+    findings: list[str] = []
+    has_c2pa = False
+    has_ai = False
+    if data[:6] not in GIF_SIGS:
+        return False, False, ["not a GIF"]
+    n = len(data)
+    pos = 6
+    if pos + 7 > n:
+        return False, False, ["truncated GIF header"]
+    packed = data[pos + 4]
+    pos += 7
+    if packed & 0x80:  # global color table present
+        pos += 3 * (1 << ((packed & 0x07) + 1))
+    while pos < n:
+        block = data[pos]
+        if block == 0x3B:  # trailer
+            break
+        if block == 0x21:
+            info = _gif_extension_info(data, pos, n)
+            if info is None:
+                findings.append("truncated GIF extension")
+                break
+            end, label, payload = info
+            if label == 0xFE:
+                findings.append("GIF comment extension present")
+                hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+                if hits:
+                    has_ai = True
+                    findings.append(f"GIF comment: {', '.join(hits[:6])}")
+            elif label == 0xFF:
+                if payload.startswith(GIF_XMP_APPLICATION_ID):
+                    findings.append("GIF XMP application extension present")
+                    hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+                    if hits:
+                        has_ai = True
+                        findings.append(f"GIF XMP: {', '.join(hits[:6])}")
+                elif any(m in payload[:11] for m in (b"c2pa", b"jumb", b"C2PA", b"JUMB")):
+                    has_c2pa = True
+                    findings.append("GIF application extension (possible C2PA)")
+            pos = end
+        elif block == 0x2C:
+            end = _gif_image_end(data, pos, n)
+            if end is None:
+                findings.append("truncated GIF image block")
+                break
+            pos = end
+        else:
+            pos += 1
+    whole = _contains_any(data, C2PA_MARKERS)
+    if whole and not has_c2pa:
+        has_c2pa = True
+        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+    if not findings:
+        findings.append("no GIF metadata extensions found")
+    return has_c2pa, has_ai or has_c2pa, findings
+
+
+def strip_gif(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
+    """Rebuild the GIF without comment/XMP metadata, keeping control blocks.
+
+    Comment (0xFE) and XMP application (0xFF "XMP DataXMP") extensions carry
+    metadata and are dropped in strip-all mode; unknown application extensions
+    are dropped too. NETSCAPE2.0 (loop count) and ICC (color) extensions are
+    rendering control, not provenance, so they are preserved unless they
+    themselves contain AI/C2PA markers. Graphic-control, plain-text, and image
+    blocks are always copied verbatim.
+    """
+    if data[:6] not in GIF_SIGS:
+        raise ValueError("not GIF")
+    actions: list[str] = []
+    out = bytearray(data[:6])
+    n = len(data)
+    pos = 6
+    if pos + 7 > n:
+        raise ValueError("truncated GIF header")
+    packed = data[pos + 4]
+    out.extend(data[pos : pos + 7])
+    pos += 7
+    if packed & 0x80:  # global color table present
+        gct_size = 3 * (1 << ((packed & 0x07) + 1))
+        out.extend(data[pos : pos + gct_size])
+        pos += gct_size
+
+    while pos < n:
+        block = data[pos]
+        if block == 0x3B:  # trailer
+            out.extend(data[pos:])
+            break
+        if block == 0x21:
+            info = _gif_extension_info(data, pos, n)
+            if info is None:
+                out.extend(data[pos:])
+                break
+            end, label, payload = info
+            drop = False
+            name = "extension"
+            if label == 0xFE:
+                name = "comment"
+                drop = strip_all_metadata or bool(
+                    _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+                )
+            elif label == 0xFF:
+                ident = payload[:11]
+                marker_hit = bool(_contains_any(payload, AI_META_HINTS + C2PA_MARKERS))
+                if ident == GIF_XMP_APPLICATION_ID:
+                    name = "XMP application"
+                    drop = strip_all_metadata or marker_hit
+                elif ident in _GIF_CONTROL_APPLICATION_IDS:
+                    name = "control application"
+                    drop = marker_hit  # keep looping/ICC unless it carries markers
+                else:
+                    name = "application"
+                    drop = strip_all_metadata or marker_hit
+            if drop:
+                actions.append(f"drop GIF {name} extension")
+            else:
+                out.extend(data[pos:end])
+            pos = end
+        elif block == 0x2C:
+            end = _gif_image_end(data, pos, n)
+            if end is None:
+                out.extend(data[pos:])
+                break
+            out.extend(data[pos:end])
+            pos = end
+        else:
+            out.extend(data[pos : pos + 1])
+            pos += 1
+
+    if not actions:
+        actions.append("no GIF metadata blocks removed (already clean or none matched)")
+    return bytes(out), actions
+
+
+# ---------------------------------------------------------------------------
+# TIFF (classic + BigTIFF)
+# ---------------------------------------------------------------------------
+
+_TIFF_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+
+# Provenance / descriptive metadata tags stripped when cleaning TIFF.
+_TIFF_META_TAG_NAMES = {
+    269: "DocumentName",
+    270: "ImageDescription",
+    271: "Make",
+    272: "Model",
+    305: "Software",
+    306: "DateTime",
+    315: "Artist",
+    316: "HostComputer",
+    33432: "Copyright",
+    40091: "XPTitle",
+    40092: "XPComment",
+    40093: "XPAuthor",
+    40094: "XPKeywords",
+    40095: "XPSubject",
+    700: "XMP",
+    33723: "IPTC/NAA",
+    34377: "Photoshop",
+    34665: "ExifIFD",
+    34853: "GPSInfo",
+    37500: "MakerNote",
+}
+
+_TIFF_DROP_TAGS = frozenset(_TIFF_META_TAG_NAMES)
+
+# Structural tags that must survive even when their payload looks marker-ish
+# (offset lists, color tables, compression tables, DNG core tags).
+_TIFF_KEEP_TAGS = frozenset(
+    {
+        254,
+        255,
+        256,
+        257,
+        258,
+        259,
+        262,
+        263,
+        264,
+        265,
+        266,
+        273,
+        274,
+        277,
+        278,
+        279,
+        282,
+        283,
+        284,
+        285,
+        286,
+        287,
+        288,
+        289,
+        290,
+        291,
+        292,
+        293,
+        294,
+        295,
+        296,
+        297,
+        301,
+        302,
+        304,
+        320,
+        321,
+        322,
+        323,
+        324,
+        325,
+        326,
+        327,
+        328,
+        329,
+        330,
+        331,
+        332,
+        333,
+        334,
+        336,
+        338,
+        339,
+        340,
+        341,
+        342,
+        343,
+        344,
+        345,
+        346,
+        347,
+        512,
+        513,
+        514,
+        515,
+        516,
+        517,
+        518,
+        519,
+        520,
+        521,
+        529,
+        530,
+        531,
+        532,
+        533,
+        33421,
+        33422,
+        33423,
+        34675,
+        34676,
+        *range(50706, 50742),  # DNG structural tags
+    }
+)
+
+MAX_TIFF_IFDS = 4096
+
+
+def _tiff_layout(data: bytes) -> tuple[str, bool] | None:
+    """Return (byte_order, bigtiff) for a classic or BigTIFF, else None."""
+    if data[:2] == b"II" and data[2:4] == b"*\x00":
+        return "<", False
+    if data[:2] == b"MM" and data[2:4] == b"\x00*":
+        return ">", False
+    if data[:2] == b"II" and data[2:4] == b"+\x00":
+        return "<", True
+    if data[:2] == b"MM" and data[2:4] == b"\x00+":
+        return ">", True
+    return None
+
+
+def _parse_tiff_ifds(data: bytes) -> tuple[str, bool, dict[int, dict[str, Any]]]:
+    """Parse every reachable TIFF IFD (classic 12-byte or BigTIFF 20-byte entries).
+
+    Returns (byte_order, bigtiff, {offset: {count, entries, next, block_len}}).
+    Each entry is {tag, type, count, value (inline field bytes), byte_size,
+    value_offset}; value_offset is None when the value is inline. Cycle-
+    protected with a hard cap on the number of IFDs.
+    """
+    layout = _tiff_layout(data)
+    if layout is None:
+        raise ValueError("not a TIFF")
+    bo, bigtiff = layout
+    n = len(data)
+    count_len = 8 if bigtiff else 2
+    off_len = 8 if bigtiff else 4
+    entry_size = 20 if bigtiff else 12
+    header_size = 16 if bigtiff else 8
+    count_fmt = bo + ("Q" if bigtiff else "H")
+    off_fmt = bo + ("Q" if bigtiff else "I")
+    if n < header_size:
+        return bo, bigtiff, {}
+    first = struct.unpack(off_fmt, data[header_size - off_len : header_size])[0]
+    if first == 0 or first + count_len > n:
+        return bo, bigtiff, {}
+    ifds: dict[int, dict[str, Any]] = {}
+    seen: set[int] = set()
+    todo = [first]
+    while todo and len(ifds) < MAX_TIFF_IFDS:
+        off = todo.pop()
+        if off in seen or off + count_len > n:
+            continue
+        seen.add(off)
+        count = struct.unpack(count_fmt, data[off : off + count_len])[0]
+        block_len = count_len + count * entry_size
+        entries: list[dict[str, Any]] = []
+        if off + block_len + off_len <= n:
+            next_ptr = struct.unpack(off_fmt, data[off + block_len : off + block_len + off_len])[0]
+        else:
+            block_len = max(0, n - off - off_len)
+            next_ptr = 0
+        for i in range(count):
+            e = off + count_len + i * entry_size
+            if e + entry_size > n:
+                break
+            tag = struct.unpack(bo + "H", data[e : e + 2])[0]
+            ftype = struct.unpack(bo + "H", data[e + 2 : e + 4])[0]
+            fcount = struct.unpack(off_fmt, data[e + 4 : e + 4 + off_len])[0]
+            value = data[e + 4 + off_len : e + entry_size]
+            byte_size = fcount * _TIFF_TYPE_SIZES.get(ftype, 1)
+            value_offset = None
+            if byte_size > len(value):
+                value_offset = struct.unpack(off_fmt, value[:off_len])[0]
+            entries.append(
+                {
+                    "tag": tag,
+                    "type": ftype,
+                    "count": fcount,
+                    "value": value,
+                    "byte_size": byte_size,
+                    "value_offset": value_offset,
+                }
+            )
+        ifds[off] = {
+            "count": count,
+            "entries": entries,
+            "next": next_ptr,
+            "block_len": block_len,
+        }
+        if next_ptr:
+            todo.append(next_ptr)
+        for ent in entries:
+            if ent["tag"] in (34665, 34853, 40965):
+                ptr = struct.unpack(off_fmt, ent["value"][:off_len])[0]
+                if ptr:
+                    todo.append(ptr)
+    return bo, bigtiff, ifds
+
+
+def _tiff_entry_payload(data: bytes, ent: dict[str, Any]) -> bytes | None:
+    if ent["value_offset"] is None:
+        return ent["value"][: ent["byte_size"]] if ent["byte_size"] <= len(ent["value"]) else None
+    vo = ent["value_offset"]
+    return data[vo : vo + ent["byte_size"]]
+
+
+def inspect_tiff(data: bytes) -> tuple[bool, bool, list[str]]:
+    """Walk the IFD chains (classic or BigTIFF) and report metadata tags."""
+    findings: list[str] = []
+    has_c2pa = False
+    has_ai = False
+    try:
+        _bo, _big, ifds = _parse_tiff_ifds(data)
+    except ValueError:
+        return False, False, ["not a valid TIFF"]
+    if not ifds:
+        return False, False, ["TIFF with no image file directories"]
+    for _off, ifd in sorted(ifds.items()):
+        for ent in ifd["entries"]:
+            tag = ent["tag"]
+            payload = _tiff_entry_payload(data, ent)
+            hits = _contains_any(payload or b"", AI_META_HINTS + C2PA_MARKERS)
+            if hits:
+                if any(
+                    h.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth") for h in hits
+                ):
+                    has_c2pa = True
+                has_ai = True
+                findings.append(f"TIFF tag {tag}: {', '.join(hits[:6])}")
+            name = _TIFF_META_TAG_NAMES.get(tag)
+            if name:
+                label = "sub-IFD" if tag in (34665, 34853, 40965) else "tag"
+                findings.append(f"TIFF {label} {tag} ({name}) present")
+    whole = _contains_any(data, C2PA_MARKERS)
+    if whole and not has_c2pa:
+        has_c2pa = True
+        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+    if not findings:
+        findings.append("no TIFF metadata tags found")
+    return has_c2pa, has_ai or has_c2pa, findings
+
+
+def _collect_tiff_sub_ifd_drops(
+    off_fmt: str,
+    off_len: int,
+    ifds: dict[int, dict[str, Any]],
+    data_len: int,
+    ptr: int,
+    drop_ranges: list[tuple[int, int]],
+    drop_ifd_ranges: list[tuple[int, int]],
+    seen: set[int],
+) -> None:
+    """Record the region and value payloads of a dropped sub-IFD chain."""
+    sub = ifds.get(ptr)
+    if sub is None or ptr in seen:
+        return
+    seen.add(ptr)
+    drop_ifd_ranges.append((ptr, min(ptr + sub["block_len"] + off_len, data_len)))
+    for ent in sub["entries"]:
+        if ent["tag"] in (34665, 34853):
+            p2 = struct.unpack(off_fmt, ent["value"][:off_len])[0]
+            if p2:
+                _collect_tiff_sub_ifd_drops(
+                    off_fmt, off_len, ifds, data_len, p2, drop_ranges, drop_ifd_ranges, seen
+                )
+        elif ent["value_offset"] is not None:
+            vo, vs = ent["value_offset"], ent["byte_size"]
+            if vo + vs <= data_len:
+                drop_ranges.append((vo, vo + vs))
+
+
+def strip_tiff(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
+    """Drop TIFF metadata tags (classic or BigTIFF) without moving referenced data.
+
+    Each IFD entry region is patched in place — kept entries copied verbatim,
+    dropped entries removed, the block zero-padded to its original length — so
+    every offset (strip/tile offsets, next-IFD pointers, color tables) stays
+    valid. Payloads of dropped tags and orphaned sub-IFD chains are zeroed
+    unless a kept entry still references them.
+    """
+    bo, bigtiff, ifds = _parse_tiff_ifds(data)
+    if not ifds:
+        raise ValueError("not a valid TIFF (no image file directories)")
+    n = len(data)
+    off_len = 8 if bigtiff else 4
+    off_fmt = bo + ("Q" if bigtiff else "I")
+    count_fmt = bo + ("Q" if bigtiff else "H")
+    actions: list[str] = []
+    kept: dict[int, list[dict[str, Any]]] = {}
+    drop_ranges: list[tuple[int, int]] = []
+    drop_ifd_ranges: list[tuple[int, int]] = []
+
+    for off, ifd in sorted(ifds.items()):
+        keep_here: list[dict[str, Any]] = []
+        for ent in ifd["entries"]:
+            tag = ent["tag"]
+            payload = _tiff_entry_payload(data, ent)
+            marker_hit = bool(_contains_any(payload or b"", AI_META_HINTS + C2PA_MARKERS))
+            if tag in (34665, 34853):
+                ptr = struct.unpack(off_fmt, ent["value"][:off_len])[0]
+                sub = ifds.get(ptr)
+                if sub is not None:
+                    sub_blob = data[ptr : min(ptr + sub["block_len"] + off_len, n)]
+                    marker_hit = marker_hit or bool(
+                        _contains_any(sub_blob, AI_META_HINTS + C2PA_MARKERS)
+                    )
+                    for sent in sub["entries"]:
+                        s_payload = _tiff_entry_payload(data, sent)
+                        if _contains_any(s_payload or b"", AI_META_HINTS + C2PA_MARKERS):
+                            marker_hit = True
+                            break
+            drop = False
+            if tag in _TIFF_DROP_TAGS:
+                drop = strip_all_metadata or marker_hit
+            elif marker_hit and tag not in _TIFF_KEEP_TAGS:
+                drop = True
+            if not drop:
+                keep_here.append(ent)
+                continue
+            name = _TIFF_META_TAG_NAMES.get(tag)
+            actions.append(
+                f"drop TIFF tag {tag} ({name})" if name else f"drop TIFF tag {tag} (AI markers)"
+            )
+            if tag in (34665, 34853):
+                ptr = struct.unpack(off_fmt, ent["value"][:off_len])[0]
+                _collect_tiff_sub_ifd_drops(
+                    off_fmt, off_len, ifds, n, ptr, drop_ranges, drop_ifd_ranges, set()
+                )
+            elif ent["value_offset"] is not None and ent["value_offset"] + ent["byte_size"] <= n:
+                drop_ranges.append((ent["value_offset"], ent["value_offset"] + ent["byte_size"]))
+        kept[off] = keep_here
+
+    # Ranges still referenced from the root through kept entries must never be
+    # zeroed. An orphaned sub-IFD (its pointer dropped) contributes nothing.
+    reachable: set[int] = set()
+
+    def _mark_reachable(off: int) -> None:
+        if off in reachable or off not in ifds:
+            return
+        reachable.add(off)
+        for ent in kept.get(off, []):
+            if ent["tag"] in (34665, 34853, 40965):
+                _mark_reachable(struct.unpack(off_fmt, ent["value"][:off_len])[0])
+        if ifds[off]["next"]:
+            _mark_reachable(ifds[off]["next"])
+
+    root = (
+        struct.unpack(off_fmt, data[16 - off_len : 16])[0]
+        if bigtiff
+        else struct.unpack(off_fmt, data[8 - off_len : 8])[0]
+    )
+    _mark_reachable(root)
+
+    referenced: list[tuple[int, int]] = []
+    for off in sorted(reachable):
+        for ent in kept.get(off, []):
+            if ent["value_offset"] is not None and ent["value_offset"] + ent["byte_size"] <= n:
+                referenced.append((ent["value_offset"], ent["value_offset"] + ent["byte_size"]))
+            if ent["tag"] in (34665, 34853, 40965):
+                ptr = struct.unpack(off_fmt, ent["value"][:off_len])[0]
+                sub = ifds.get(ptr)
+                if sub is not None:
+                    referenced.append((ptr, min(ptr + sub["block_len"] + off_len, n)))
+
+    def _covered(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+        return any(s <= start and end <= e for s, e in ranges)
+
+    zero: list[tuple[int, int]] = []
+    for s, e in drop_ranges:
+        if not _covered(referenced, s, e):
+            zero.append((s, e))
+    for s, e in drop_ifd_ranges:
+        if not _covered(referenced, s, e):
+            zero.append((s, e))
+
+    # Patch IFD entry regions in place, then zero dropped payloads.
+    out = bytearray(data)
+    for off, ifd in sorted(ifds.items()):
+        entries = kept.get(off, [])
+        block = bytearray()
+        block.extend(struct.pack(count_fmt, len(entries)))
+        for ent in entries:
+            block.extend(struct.pack(bo + "H", ent["tag"]))
+            block.extend(struct.pack(bo + "H", ent["type"]))
+            block.extend(struct.pack(off_fmt, ent["count"]))
+            block.extend(ent["value"])
+        block.extend(struct.pack(off_fmt, ifd["next"]))
+        region_len = ifd["block_len"] + off_len
+        if off + region_len <= n:
+            if len(block) > region_len:
+                block = block[:region_len]
+            out[off : off + region_len] = block + b"\x00" * (region_len - len(block))
+    for s, e in zero:
+        out[s:e] = b"\x00" * (e - s)
+
+    if not actions:
+        actions.append("no TIFF metadata tags removed (already clean or none matched)")
+    return bytes(out), actions
 
 
 def run_optional_tools(path: Path) -> dict[str, Any]:
@@ -428,6 +1150,7 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
                 text=True,
                 timeout=30,
                 preexec_fn=subprocess_preexec_fn,
+                check=False,
             )
             out = (r.stdout or "") + (r.stderr or "")
             low = out.lower()
@@ -440,9 +1163,7 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
                 "available": True,
                 "returncode": r.returncode,
                 "snippet": out[:2000],
-                "has_manifest": (
-                    "claim" in low or "c2pa" in low or "manifest" in low
-                )
+                "has_manifest": ("claim" in low or "c2pa" in low or "manifest" in low)
                 and not no_manifest,
             }
         except Exception as e:
@@ -459,6 +1180,7 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
                 text=True,
                 timeout=30,
                 preexec_fn=subprocess_preexec_fn,
+                check=False,
             )
             out = r.stdout or ""
             interesting = [
@@ -481,15 +1203,62 @@ def run_optional_tools(path: Path) -> dict[str, Any]:
     return tools
 
 
+def _synthid_score_http(
+    path: Path, base_url: str, api_key: str, timeout: float
+) -> dict[str, Any] | None:
+    """Score *path* via the HTTP sidecar (synthid_score_server.py)."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return {"available": False, "error": f"cannot read {path}: {e}"}
+    body = json.dumps({"file": base64.b64encode(data).decode("ascii")}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if urlparse(base_url).scheme not in ("http", "https"):
+        return {"available": False, "error": f"refusing non-http(s) scorer endpoint: {base_url}"}
+    # S310: URL scheme is restricted to http/https just above.
+    req = urllib.request.Request(  # noqa: S310
+        base_url.rstrip("/") + "/score",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ) as e:
+        return {"available": False, "error": f"SynthID scorer sidecar unreachable: {e}"}
+    if not isinstance(payload, dict):
+        return {"available": False, "error": "bad scorer sidecar response"}
+    return payload
+
+
 def run_synthid_score(
     path: Path,
     upstream_dir: str | None = None,
 ) -> dict[str, Any] | None:
-    """Run the optional reverse-SynthID scorer in a subprocess.
+    """Run the optional reverse-SynthID scorer.
 
-    Returns None when the scorer is not configured or unavailable (exit 3),
-    so callers can keep the default "no SynthID score" behavior.
+    Uses the HTTP sidecar when WATERMARKS_SYNTHID_SCORER_URL is set,
+    otherwise a subprocess against a local checkout. Returns None when the
+    scorer is not configured or unavailable (exit 3), so callers can keep
+    the default "no SynthID score" behavior.
     """
+    scorer_url = os.environ.get("WATERMARKS_SYNTHID_SCORER_URL", "").strip()
+    if scorer_url:
+        api_key = os.environ.get("WATERMARKS_SYNTHID_SCORER_API_KEY", "").strip()
+        try:
+            timeout = float(os.environ.get("WATERMARKS_SYNTHID_SCORER_TIMEOUT", "60"))
+        except ValueError:
+            timeout = DEFAULT_SYNTHID_SCORER_TIMEOUT
+        return _synthid_score_http(path, scorer_url, api_key, timeout)
     if upstream_dir is None:
         upstream_dir = os.environ.get("REVERSE_SYNTHID_DIR")
     if not upstream_dir:
@@ -511,6 +1280,7 @@ def run_synthid_score(
             text=True,
             timeout=180,
             preexec_fn=subprocess_preexec_fn,
+            check=False,
         )
     except Exception as e:
         return {"available": False, "error": str(e)}
@@ -569,9 +1339,7 @@ def run_markdiffusion_purify(
     if upstream_dir is None:
         upstream_dir = os.environ.get("MARKDIFFUSION_DIR")
 
-    upstream = (
-        Path(upstream_dir).expanduser().resolve() if upstream_dir else None
-    )
+    upstream = Path(upstream_dir).expanduser().resolve() if upstream_dir else None
     if upstream is not None and not upstream.is_dir():
         return {
             "available": False,
@@ -608,6 +1376,7 @@ def run_markdiffusion_purify(
             text=True,
             timeout=timeout,
             preexec_fn=ctrlregen_subprocess_preexec_fn,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -686,6 +1455,7 @@ def run_ctrlregen_clean(
             text=True,
             timeout=timeout,
             preexec_fn=ctrlregen_subprocess_preexec_fn,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return {"available": False, "error": f"CtrlRegen timed out after {timeout}s"}
@@ -716,14 +1486,24 @@ def inspect_image(
         has_c2pa, has_ai, findings = inspect_webp(data)
     elif fmt in ("avif", "heic"):
         has_c2pa, has_ai, findings = inspect_isobmff(data, fmt)
+    elif fmt == "bmp":
+        has_c2pa, has_ai, findings = inspect_bmp(data)
+    elif fmt == "gif":
+        has_c2pa, has_ai, findings = inspect_gif(data)
+    elif fmt == "tiff":
+        has_c2pa, has_ai, findings = inspect_tiff(data)
     else:
-        has_c2pa, has_ai, findings = False, False, [
-            "unsupported format (PNG/JPEG/WebP/AVIF/HEIC)"
-        ]
+        has_c2pa, has_ai, findings = (
+            False,
+            False,
+            ["unsupported format (PNG/JPEG/WebP/AVIF/HEIC/BMP/GIF/TIFF)"],
+        )
 
     notes: list[str] = []
     if fmt == "unknown":
-        notes.append("format not fully inspected; only PNG/JPEG/WebP/AVIF/HEIC are supported")
+        notes.append(
+            "format not fully inspected; only PNG/JPEG/WebP/AVIF/HEIC/BMP/GIF/TIFF are supported"
+        )
 
     tools = run_optional_tools(path)
     # Elevate flags from tools
@@ -835,7 +1615,6 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
             seglen = struct.unpack(">H", data[i : i + 2])[0]
             # Find EOI from here carefully: after SOS segment header, scan for FF D9
             # not preceded by stuffed FF 00 issues — simple approach: copy from FF DA to end
-            sos_start = i - 2  # points at 0xFF before marker... actually marker already consumed
             # Reconstruct: FF DA + rest of file
             out.extend(b"\xff\xda")
             out.extend(data[i:])
@@ -899,9 +1678,7 @@ def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     for fourcc, payload, padding in chunks:
         drop = fourcc.upper() == b"C2PA"
         if fourcc in metadata_flags:
-            drop = strip_all_metadata or bool(
-                _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
-            )
+            drop = strip_all_metadata or bool(_contains_any(payload, AI_META_HINTS + C2PA_MARKERS))
         if drop:
             name = fourcc.decode("latin-1", errors="replace")
             actions.append(f"drop WebP chunk {name}")
@@ -911,12 +1688,13 @@ def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
 
     body = bytearray(WEBP_SIG)
     for fourcc, payload, padding in kept:
-        if fourcc == b"VP8X" and len(payload) >= 1 and removed_flags:
-            payload = bytes([payload[0] & ~removed_flags]) + payload[1:]
+        chunk = payload
+        if fourcc == b"VP8X" and len(chunk) >= 1 and removed_flags:
+            chunk = bytes([chunk[0] & ~removed_flags]) + chunk[1:]
         body.extend(fourcc)
-        body.extend(struct.pack("<I", len(payload)))
-        body.extend(payload)
-        body.extend(padding if len(payload) & 1 else b"")
+        body.extend(struct.pack("<I", len(chunk)))
+        body.extend(chunk)
+        body.extend(padding if len(chunk) & 1 else b"")
 
     if not actions:
         actions.append("no WebP metadata chunks removed (already clean or none matched)")
@@ -933,7 +1711,7 @@ def strip_isobmff(
     actions: list[str] = []
     out = bytearray()
 
-    for fourcc, payload, size, header_size in boxes:
+    for fourcc, payload, _size, _header_size in boxes:
         name = fourcc.decode("latin-1", errors="replace")
         if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
             actions.append(f"drop top-level {name} box (C2PA/JUMBF)")
@@ -951,7 +1729,7 @@ def strip_isobmff(
             meta_verflags = payload[:4] if len(payload) >= 4 else b"\x00\x00\x00\x00"
             sub_boxes = _parse_isobmff_boxes(payload, start=4)
             clean_sub = bytearray()
-            for s_fourcc, s_payload, s_size, s_hdr in sub_boxes:
+            for s_fourcc, s_payload, _s_size, _s_hdr in sub_boxes:
                 s_name = s_fourcc.decode("latin-1", errors="replace")
                 if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
                     actions.append(f"drop meta sub-box {s_name} (C2PA/JUMBF)")
@@ -960,33 +1738,24 @@ def strip_isobmff(
                     if s_payload.startswith(XMP_UUID):
                         actions.append(f"drop meta sub-box {s_name} (XMP metadata)")
                         continue
-                    if strip_all_metadata or _contains_any(
-                        s_payload, AI_META_HINTS + C2PA_MARKERS
-                    ):
+                    if strip_all_metadata or _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS):
                         actions.append(f"drop meta sub-box {s_name} (UUID metadata)")
                         continue
-                if s_fourcc in (b"xml ", b"bxml"):
-                    if strip_all_metadata or _contains_any(
-                        s_payload, AI_META_HINTS + C2PA_MARKERS
-                    ):
-                        actions.append(f"drop meta sub-box {s_name} (XML metadata)")
-                        continue
-                clean_sub.extend(
-                    struct.pack(">I", len(s_payload) + 8) + s_fourcc + s_payload
-                )
+                if s_fourcc in (b"xml ", b"bxml") and (
+                    strip_all_metadata or _contains_any(s_payload, AI_META_HINTS + C2PA_MARKERS)
+                ):
+                    actions.append(f"drop meta sub-box {s_name} (XML metadata)")
+                    continue
+                clean_sub.extend(struct.pack(">I", len(s_payload) + 8) + s_fourcc + s_payload)
 
             new_meta_payload = meta_verflags + clean_sub
-            out.extend(
-                struct.pack(">I", len(new_meta_payload) + 8) + b"meta" + new_meta_payload
-            )
+            out.extend(struct.pack(">I", len(new_meta_payload) + 8) + b"meta" + new_meta_payload)
             continue
 
         out.extend(struct.pack(">I", len(payload) + 8) + fourcc + payload)
 
     if not actions:
-        actions.append(
-            f"no {fmt.upper()} metadata boxes removed (already clean or none matched)"
-        )
+        actions.append(f"no {fmt.upper()} metadata boxes removed (already clean or none matched)")
 
     return bytes(out), actions
 
@@ -1023,6 +1792,12 @@ def clean_image(
         cleaned, actions = strip_webp(data, strip_all_metadata=strip_all_metadata)
     elif fmt in ("avif", "heic"):
         cleaned, actions = strip_isobmff(data, fmt, strip_all_metadata=strip_all_metadata)
+    elif fmt == "bmp":
+        cleaned, actions = strip_bmp(data, strip_all_metadata=strip_all_metadata)
+    elif fmt == "gif":
+        cleaned, actions = strip_gif(data, strip_all_metadata=strip_all_metadata)
+    elif fmt == "tiff":
+        cleaned, actions = strip_tiff(data, strip_all_metadata=strip_all_metadata)
     else:
         raise ValueError(f"unsupported format: {fmt}")
 
@@ -1082,8 +1857,7 @@ def clean_image(
             )
             if pixel_removal.get("available"):
                 actions.append(
-                    f"DiffusionPurification pixel removal "
-                    f"(strength {markdiffusion_strength})"
+                    f"DiffusionPurification pixel removal (strength {markdiffusion_strength})"
                 )
             else:
                 actions.append(

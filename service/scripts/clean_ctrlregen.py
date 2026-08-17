@@ -52,7 +52,7 @@ def resolve_device(raw: str | None) -> str:
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
             return "mps"
-    except Exception:
+    except Exception:  # noqa: S110 - optional torch device detection
         pass
     return "cpu"
 
@@ -131,8 +131,8 @@ def main() -> int:
 
     sys.path.insert(0, str(src_dir))
     try:
-        from PIL import Image  # noqa: E402
-        from ctrlregen.engine import CtrlRegenEngine, is_ctrlregen_available  # noqa: E402
+        from ctrlregen.engine import CtrlRegenEngine, is_ctrlregen_available
+        from PIL import Image
     except ImportError as e:
         print(f"CtrlRegen dependencies missing: {e}", file=sys.stderr)
         print("run setup_ctrlregen.sh first", file=sys.stderr)

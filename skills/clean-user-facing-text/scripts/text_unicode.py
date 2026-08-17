@@ -5,6 +5,7 @@ from __future__ import annotations
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 # Format / invisible controls commonly used for steganography or broken pastes.
 STRIP_CODEPOINTS: frozenset[int] = frozenset(
@@ -163,7 +164,7 @@ LATIN_CONFUSABLES: dict[int, str] = {
     0xFF5A: "z",
 }
 
-# Variation selectors beyond FE0x (VS17–VS256 in Supplementary Special-purpose)
+# Variation selectors beyond FE0x (VS17-VS256 in Supplementary Special-purpose)
 _VS_SUPPLEMENT = range(0xE0100, 0xE01F0)
 
 
@@ -185,10 +186,25 @@ _BIDI_CPS: frozenset[int] = frozenset(
     }
 )
 
-# Zero-width family (common edit-based carriers)
-_ZW_FAMILY: frozenset[int] = frozenset(
-    {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E}
+# Directional marks and isolates are legitimate in mixed RTL/LTR prose. Inspect
+# them, but preserve them during the default clean. Paired LRE/RLE embeddings
+# (see _valid_bidi_embedding_indices) are preserved too; overrides and
+# unpaired embeddings remain destructive by default because they can reorder
+# unrelated spans.
+_PRESERVABLE_BIDI_CPS: frozenset[int] = frozenset(
+    {
+        0x061C,
+        0x200E,
+        0x200F,
+        0x2066,
+        0x2067,
+        0x2068,
+        0x2069,
+    }
 )
+
+# Zero-width family (common edit-based carriers)
+_ZW_FAMILY: frozenset[int] = frozenset({0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E})
 
 
 def _is_private_use(cp: int) -> bool:
@@ -201,12 +217,10 @@ def _is_strip_cp(cp: int) -> bool:
         return True
     if cp in _VS_SUPPLEMENT:
         return True
-    # Tag characters used in some stego schemes (U+E0001–U+E007F)
+    # Tag characters used in some stego schemes (U+E0001-U+E007F)
     if 0xE0001 <= cp <= 0xE007F:
         return True
-    if _is_private_use(cp):
-        return True
-    return False
+    return bool(_is_private_use(cp))
 
 
 def _strip_kind(cp: int) -> str:
@@ -239,15 +253,16 @@ def _is_emoji_base(cp: int) -> bool:
     """Return True for characters that can start or continue an emoji sequence."""
     if 0x1F000 <= cp <= 0x1FAFF:
         return True
+    if 0x2190 <= cp <= 0x25FF:  # arrows, technical symbols, enclosed symbols
+        return True
     if 0x2600 <= cp <= 0x27BF:  # misc symbols / dingbats / arrows
         return True
     if 0x2B00 <= cp <= 0x2BFF:  # misc symbols and arrows
         return True
     if cp in (0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299):
         return True
-    if cp in (0x0023, 0x002A) or 0x0030 <= cp <= 0x0039:  # keycap bases
-        return True
-    return False
+    # keycap bases
+    return cp in (0x0023, 0x002A) or 0x0030 <= cp <= 0x0039
 
 
 # ZWNJ/ZWJ are orthographic inside complex scripts (Persian می‌روم, Devanagari
@@ -268,9 +283,71 @@ _HANGUL_FILLERS: frozenset[int] = frozenset({0x115F, 0x1160})
 _SCRIPT_GLUE: frozenset[int] = _MONGOLIAN_FVS | _KHMER_VOWELS | _HANGUL_FILLERS
 
 
-def _is_joining_letter(cp: int) -> bool:
-    """Non-ASCII letter/mark — the neighbour that makes a joiner orthographic."""
-    return cp > 0x7F and unicodedata.category(chr(cp))[0] in ("L", "M")
+def _joining_script(cp: int) -> str | None:
+    """Return a broad script group where ZWJ/ZWNJ can be orthographic."""
+    for start, end, name in (
+        (0x0600, 0x08FF, "arabic"),
+        (0x0900, 0x0DFF, "indic"),
+        (0x0F00, 0x109F, "south-asian"),
+        (0x1780, 0x17FF, "khmer"),
+        (0x1800, 0x18AF, "mongolian"),
+    ):
+        if start <= cp <= end and unicodedata.category(chr(cp))[0] in ("L", "M"):
+            return name
+    return None
+
+
+def _is_cjk_ideograph(cp: int) -> bool:
+    return (
+        0x3400 <= cp <= 0x4DBF
+        or 0x4E00 <= cp <= 0x9FFF
+        or 0xF900 <= cp <= 0xFAFF
+        or 0x20000 <= cp <= 0x323AF
+    )
+
+
+def _is_mongolian_base(cp: int) -> bool:
+    return 0x1800 <= cp <= 0x18AF
+
+
+def _is_variation_selector(cp: int) -> bool:
+    return cp in _VS_SUPPLEMENT or 0xFE00 <= cp <= 0xFE0F or 0x180B <= cp <= 0x180D
+
+
+def _valid_flag_tag_indices(text: str) -> set[int]:
+    """Indices in complete subdivision-flag tag sequences."""
+    valid: set[int] = set()
+    i = 0
+    while i < len(text):
+        if ord(text[i]) != 0x1F3F4:  # waving black flag
+            i += 1
+            continue
+        j = i + 1
+        while j < len(text) and 0xE0020 <= ord(text[j]) <= 0xE007E:
+            j += 1
+        if j > i + 1 and j < len(text) and ord(text[j]) == 0xE007F:
+            valid.update(range(i + 1, j + 1))
+            i = j + 1
+        else:
+            i += 1
+    return valid
+
+
+def _valid_bidi_embedding_indices(text: str) -> set[int]:
+    """Indices belonging to complete LRE/RLE ... PDF pairs, excluding overrides."""
+    valid: set[int] = set()
+    stack: list[tuple[int, int]] = []
+    for index, char in enumerate(text):
+        cp = ord(char)
+        if cp in (0x202A, 0x202B, 0x202D, 0x202E):
+            stack.append((cp, index))
+        elif cp == 0x202C:
+            if not stack:
+                continue
+            opener, opener_index = stack.pop()
+            if opener in (0x202A, 0x202B):
+                valid.update((opener_index, index))
+    return valid
 
 
 def _is_mongolian_letter(cp: int) -> bool:
@@ -294,6 +371,7 @@ def _is_glue(cp: int) -> bool:
     or same-script filler/selector (Mongolian FVS, Khmer vowel, Hangul filler)."""
     return (
         _is_emoji_glue(cp)
+        or _is_variation_selector(cp)
         or cp in _SCRIPT_JOINERS
         or cp in _TAG_RANGE
         or cp in _SCRIPT_GLUE
@@ -303,10 +381,15 @@ def _is_glue(cp: int) -> bool:
 def _decide(
     ch: str,
     prev_kept: str | None,
+    prev_input: str | None,
+    next_input: str | None,
     *,
+    valid_flag_tag: bool,
+    valid_bidi_embedding: bool,
     normalize_spaces: bool,
     treat_confusables: bool,
     strip_emoji_glue: bool,
+    strip_bidi: bool,
 ) -> tuple[str, str, str | None]:
     """Classify one input char for both inspect and clean.
 
@@ -315,13 +398,36 @@ def _decide(
     kind is the inspect classification (None when not suspicious).
     """
     cp = ord(ch)
+    if valid_bidi_embedding and not strip_bidi:
+        return ("keep", ch, None)
+    if cp in _PRESERVABLE_BIDI_CPS and not strip_bidi:
+        return ("keep", ch, None)
+    if prev_input is not None and not strip_emoji_glue:
+        prev_cp = ord(prev_input)
+        if cp in _VS_SUPPLEMENT and _is_cjk_ideograph(prev_cp):
+            return ("keep", ch, None)
+        if 0x180B <= cp <= 0x180D and _is_mongolian_base(prev_cp):
+            return ("keep", ch, None)
+        if 0xFE00 <= cp <= 0xFE0D and _is_cjk_ideograph(prev_cp):
+            return ("keep", ch, None)
     if _is_emoji_glue(cp) and not strip_emoji_glue:
-        if prev_kept is not None and _is_emoji_base(ord(prev_kept)):
+        if cp in (0xFE0E, 0xFE0F) and prev_input is not None and _is_emoji_base(ord(prev_input)):
+            return ("keep", ch, None)
+        if (
+            cp == 0x200D
+            and prev_kept is not None
+            and next_input is not None
+            and _is_emoji_base(ord(prev_kept))
+            and _is_emoji_base(ord(next_input))
+        ):
             return ("keep", ch, None)
     if not strip_emoji_glue:
-        if cp in _SCRIPT_JOINERS and prev_kept is not None and _is_joining_letter(ord(prev_kept)):
-            return ("keep", ch, None)
-        if cp in _TAG_RANGE and prev_kept is not None and _is_emoji_base(ord(prev_kept)):
+        if cp in _SCRIPT_JOINERS and prev_input is not None and next_input is not None:
+            prev_script = _joining_script(ord(prev_input))
+            next_script = _joining_script(ord(next_input))
+            if prev_script is not None and prev_script == next_script:
+                return ("keep", ch, None)
+        if cp in _TAG_RANGE and valid_flag_tag:
             return ("keep", ch, None)
         if cp in _MONGOLIAN_FVS and prev_kept is not None and _is_mongolian_letter(ord(prev_kept)):
             return ("keep", ch, None)
@@ -398,13 +504,20 @@ def inspect_text(
 ) -> TextInspectReport:
     buckets: dict[tuple[int, str], list[int]] = {}
     prev_kept: str | None = None
+    valid_flag_tags = _valid_flag_tag_indices(text)
+    valid_bidi_embeddings = _valid_bidi_embedding_indices(text)
     for i, ch in enumerate(text):
         action, out_char, kind = _decide(
             ch,
             prev_kept,
+            text[i - 1] if i > 0 else None,
+            text[i + 1] if i + 1 < len(text) else None,
+            valid_flag_tag=i in valid_flag_tags,
+            valid_bidi_embedding=i in valid_bidi_embeddings,
             normalize_spaces=True,
             treat_confusables=aggressive,
             strip_emoji_glue=strip_emoji_glue,
+            strip_bidi=True,
         )
         if kind is None:
             # Kept; glue (emoji/script joiner/tag) does not advance the
@@ -438,7 +551,7 @@ def inspect_text(
         "Layer A only: invisible/format Unicode and space homoglyphs (edit-based carriers).",
         "Statistical (token-sampling) watermarks are not detectable here; use Layer B rewrite.",
         "Inspect kinds: strip, bidi, tag_chars, variation_selector, zwj_family, private_use, space, confusable, other_cf.",
-        "Load-bearing invisibles are preserved by default: emoji glue (ZWJ/VS after an emoji base), script joiners (ZWNJ/ZWJ inside complex scripts), flag tag chars, same-script fillers/selectors (Mongolian FVS, Khmer inherent vowels, Hangul jamo fillers), and orthographic Arabic/Syriac Cf marks. Use --strip-emoji-glue for paranoid mode (strips them all).",
+        "Load-bearing invisibles are preserved by default during cleaning: emoji glue, CJK/Mongolian variation selectors, script joiners, complete flag tag sequences, same-script fillers/selectors (Mongolian FVS, Khmer inherent vowels, Hangul jamo fillers), RTL directional marks/paired embeddings, and orthographic Arabic/Syriac Cf marks. Inspection still reports bidi controls. Use explicit strip flags only after review.",
     ]
     if not hits:
         notes.append(
@@ -455,20 +568,28 @@ def clean_text(
     aggressive_homoglyphs: bool = False,
     normalize_spaces: bool = True,
     strip_emoji_glue: bool = False,
+    strip_bidi: bool = False,
 ) -> tuple[str, dict]:
     """Return cleaned text and a stats dict."""
     removed: Counter[str] = Counter()
     replaced: Counter[str] = Counter()
     out_chars: list[str] = []
     prev_kept: str | None = None
+    valid_flag_tags = _valid_flag_tag_indices(text)
+    valid_bidi_embeddings = _valid_bidi_embedding_indices(text)
 
-    for ch in text:
+    for i, ch in enumerate(text):
         action, out_char, _kind = _decide(
             ch,
             prev_kept,
+            text[i - 1] if i > 0 else None,
+            text[i + 1] if i + 1 < len(text) else None,
+            valid_flag_tag=i in valid_flag_tags,
+            valid_bidi_embedding=i in valid_bidi_embeddings,
             normalize_spaces=normalize_spaces,
             treat_confusables=aggressive_homoglyphs,
             strip_emoji_glue=strip_emoji_glue,
+            strip_bidi=strip_bidi,
         )
         if action == "keep":
             out_chars.append(out_char)
@@ -485,11 +606,20 @@ def clean_text(
             # prev_kept unchanged
 
     result = "".join(out_chars)
+    nfkc_changed = False
     if nfkc:
         before = result
         result = unicodedata.normalize("NFKC", result)
         if result != before:
-            replaced["NFKC_normalize"] += abs(len(before) - len(result)) or 1
+            nfkc_changed = True
+            changed_inputs = sum(
+                end - start
+                for operation, start, end, _new_start, _new_end in SequenceMatcher(
+                    None, before, result, autojunk=False
+                ).get_opcodes()
+                if operation != "equal"
+            )
+            replaced["NFKC_normalize"] += changed_inputs or 1
 
     # Collapse runs of spaces only if we introduced space replacements? Keep conservative: no.
 
@@ -499,7 +629,8 @@ def clean_text(
         "removed": dict(removed),
         "replaced": dict(replaced),
         "removed_count": sum(removed.values()),
-        "replaced_count": sum(v for k, v in replaced.items() if k != "NFKC_normalize"),
+        "replaced_count": sum(replaced.values()),
+        "nfkc_changed": nfkc_changed,
     }
     return result, stats
 
@@ -513,8 +644,7 @@ def human_report(report: TextInspectReport) -> str:
         lines.append("Hits:")
         for h in report.hits:
             lines.append(
-                f"  [{h.kind}/{_hit_confidence(h.kind)}] "
-                f"{h.label} x{h.count} @ {h.samples[:5]}"
+                f"  [{h.kind}/{_hit_confidence(h.kind)}] {h.label} x{h.count} @ {h.samples[:5]}"
             )
     for n in report.notes:
         lines.append(f"Note: {n}")

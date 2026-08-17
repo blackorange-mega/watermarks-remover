@@ -58,9 +58,11 @@ def test_json_stdout_survives_noisy_upstream(tmp_path):
     img.write_bytes(b"\x89PNG\r\n\x1a\nstub")
 
     r = subprocess.run(
-        [sys.executable, str(SCRIPT), str(img),
-         "--upstream-dir", str(upstream), "--json"],
-        capture_output=True, text=True, timeout=60,
+        [sys.executable, str(SCRIPT), str(img), "--upstream-dir", str(upstream), "--json"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
 
     assert r.returncode == 0, r.stderr

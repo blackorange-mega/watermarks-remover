@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import clean_file  # noqa: E402
-import clean_image  # noqa: E402
+import clean_file
+import clean_image
 
 
 def _container_result(dest: Path, residual: bool, degraded: bool = False) -> dict:
@@ -54,7 +54,9 @@ def test_clean_file_json_and_human_agree_on_clean(monkeypatch, tmp_path):
 
 
 def test_clean_file_degraded_pdf_is_not_a_failure_in_either_mode(monkeypatch, tmp_path):
-    assert _run_clean_file(monkeypatch, tmp_path, json_flag=False, residual=True, degraded=True) == 0
+    assert (
+        _run_clean_file(monkeypatch, tmp_path, json_flag=False, residual=True, degraded=True) == 0
+    )
     assert _run_clean_file(monkeypatch, tmp_path, json_flag=True, residual=True, degraded=True) == 0
 
 

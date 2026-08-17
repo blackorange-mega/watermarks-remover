@@ -74,3 +74,27 @@ def test_installer_force_creates_backup_and_replaces(tmp_path):
     assert len(backups) == 1
     assert (backups[0] / "old").read_text(encoding="utf-8") == "old"
     assert (destination / "SKILL.md").is_file()
+
+
+def test_vendored_text_unicode_is_identical_to_service_engine():
+    # The Layer A engine is vendored byte-for-byte; only the CLI wrappers
+    # (clean_text.py, inspect_text.py, common.py) may differ. Any engine
+    # change must be applied to both copies in the same commit.
+    service = (ROOT / "service" / "scripts" / "text_unicode.py").read_bytes()
+    vendored = (SKILL / "scripts" / "text_unicode.py").read_bytes()
+    assert service == vendored
+
+
+def test_lightweight_preserves_legitimate_bidi_and_emoji_glue():
+    # Regression for engine drift: the vendored copy once blanket-stripped
+    # RTL isolates/marks and VS16 after arrows, corrupting legitimate text.
+    for raw in ("السعر ⁦123 USD⁩‏", "Move ↔️"):
+        result = subprocess.run(
+            [sys.executable, str(SKILL / "scripts" / "clean_text.py"), "-"],
+            input=raw,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=True,
+        )
+        assert result.stdout.rstrip("\n") == raw

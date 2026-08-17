@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import server  # noqa: E402
+import server
 
 
 def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
@@ -175,23 +175,25 @@ def test_clean_markdown_container(conn):
 
 
 def test_unknown_option_rejected(conn):
-    status, body = _post(conn, "/clean", {"file": _b64(b"x"), "name": "x.txt", "options": {"nope": 1}})
+    status, body = _post(
+        conn, "/clean", {"file": _b64(b"x"), "name": "x.txt", "options": {"nope": 1}}
+    )
     assert status == 400
     assert "unknown option" in body["error"]
 
 
 def test_bad_base64_rejected(conn):
-    status, body = _post(conn, "/inspect", {"file": "!!!not-base64!!!"})
+    status, _body = _post(conn, "/inspect", {"file": "!!!not-base64!!!"})
     assert status == 400
 
 
 def test_binary_named_as_text_rejected(conn):
-    status, body = _post(conn, "/clean", {"file": _b64(_watermarked_png()), "name": "x.txt"})
+    status, _body = _post(conn, "/clean", {"file": _b64(_watermarked_png()), "name": "x.txt"})
     assert status == 400
 
 
 def test_missing_file_field_rejected(conn):
-    status, body = _post(conn, "/inspect", {"name": "x.txt"})
+    status, _body = _post(conn, "/inspect", {"name": "x.txt"})
     assert status == 400
 
 
@@ -218,7 +220,7 @@ def test_traversal_name_does_not_escape(conn, tmp_path):
 def test_oversized_body_413(conn, monkeypatch):
     monkeypatch.setattr(server, "MAX_BODY_BYTES", 64)
     data = "x" * 200
-    status, body = _post(conn, "/inspect", {"file": _b64(data.encode())})
+    status, _body = _post(conn, "/inspect", {"file": _b64(data.encode())})
     assert status == 413
 
 
@@ -233,7 +235,7 @@ def test_auth_required(conn, monkeypatch):
 
 
 def test_404(conn):
-    status, body = _get(conn, "/nope")
+    status, _body = _get(conn, "/nope")
     assert status == 404
-    status, body = _post(conn, "/nope", {"file": _b64(b"x")})
+    status, _body = _post(conn, "/nope", {"file": _b64(b"x")})
     assert status == 404

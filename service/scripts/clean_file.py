@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified clean: text Layer A, PNG/JPEG/WebP metadata, and document containers."""
+"""Unified clean: text Layer A, raster metadata, and document containers."""
 
 from __future__ import annotations
 
@@ -10,19 +10,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (  # noqa: E402
+from common import (
     MAX_INPUT_BYTES,
+    ROUTER_ADVICE,
     backup_path,
     cleaned_path,
     eprint,
-    ROUTER_ADVICE,
     guard_binary,
     safe_write_text,
 )
-from container_meta import clean_container, detect_container_format  # noqa: E402
-from format_dispatch import classify  # noqa: E402
-from image_meta import clean_image  # noqa: E402
-from text_unicode import clean_text  # noqa: E402
+from container_meta import clean_container, detect_container_format
+from format_dispatch import classify
+from image_meta import clean_image
+from text_unicode import clean_text
 
 
 def main() -> int:

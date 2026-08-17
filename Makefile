@@ -1,4 +1,4 @@
-.PHONY: test smoke smoke-synthid bootstrap-synthid docker-synthid-build docker-synthid-help \
+.PHONY: test lint format lint-fix smoke smoke-synthid bootstrap-synthid docker-synthid-build docker-synthid-help \
 	smoke-ctrlregen bootstrap-ctrlregen docker-ctrlregen-build docker-ctrlregen-help \
 	smoke-markllm bootstrap-markllm docker-markllm-build docker-markllm-help \
 	smoke-markdiffusion bootstrap-markdiffusion docker-markdiffusion-build docker-markdiffusion-help \
@@ -10,6 +10,15 @@ PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else e
 
 test:
 	$(PYTHON) -m pytest
+
+lint:
+	$(PYTHON) -m ruff check service tests
+
+format:
+	$(PYTHON) -m ruff format --check service tests
+
+lint-fix:
+	$(PYTHON) -m ruff check --fix service tests
 
 smoke:
 	-python3 $(SCRIPTS)/inspect_text.py tests/fixtures/sample_watermarked.txt

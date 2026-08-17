@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import image_meta  # noqa: E402
-from image_meta import run_markdiffusion_purify  # noqa: E402
+import image_meta
+from image_meta import run_markdiffusion_purify
 
 HARNESS_SCRIPT = SCRIPTS / "markdiffusion_harness.py"
 
@@ -39,7 +39,7 @@ class Image:
         fp.write(b"FAKEPNG")
 """
 
-FAKE_MARKDIFFUSION = '''\
+FAKE_MARKDIFFUSION = """\
 class DiffusionConfig:
     def __init__(self, scheduler=None, pipe=None, device="cpu", **kwargs):
         self.device = device
@@ -71,7 +71,7 @@ class DiffusionPurification:
         return Image.new("RGB", (16, 16))
 
 from types import SimpleNamespace
-'''
+"""
 
 
 def _make_fake_upstream(tmp_path: Path) -> Path:
@@ -139,6 +139,7 @@ def test_cli_unavailable_without_upstream(tmp_path: Path):
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
     assert r.returncode == 3
     assert "markdiffusion not importable" in (r.stderr or "")
@@ -149,6 +150,7 @@ def test_cli_bad_input_missing_file(tmp_path: Path):
         [sys.executable, str(HARNESS_SCRIPT), "detect", str(tmp_path / "missing.png")],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert r.returncode == 2
 
@@ -160,6 +162,7 @@ def test_cli_bad_scheme(tmp_path: Path):
         [sys.executable, str(HARNESS_SCRIPT), "detect", str(img), "--scheme", "bogus"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert r.returncode == 2
     assert "unknown scheme" in (r.stderr or "")
@@ -172,6 +175,7 @@ def test_cli_missing_purify_output(tmp_path: Path):
         [sys.executable, str(HARNESS_SCRIPT), "purify", str(img)],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert r.returncode == 2
 
@@ -243,9 +247,7 @@ def test_cmd_detect_p_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "_load_diffusion",
         lambda model, device, offline, size: (object(), object()),
     )
-    args = _build_args(
-        mod, "detect", path=str(img), detector_type="p_value"
-    )
+    args = _build_args(mod, "detect", path=str(img), detector_type="p_value")
     assert mod._cmd_detect(args, upstream, "tr") == 0
 
 
@@ -300,9 +302,7 @@ def test_cmd_purify_runtime_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("model missing")
 
     monkeypatch.setattr(mod, "_load_diffusion", _boom)
-    args = _build_args(
-        mod, "purify", path=str(img), output=str(tmp_path / "out.png")
-    )
+    args = _build_args(mod, "purify", path=str(img), output=str(tmp_path / "out.png"))
     assert mod._cmd_purify(args, upstream) == 1
 
 
@@ -315,12 +315,10 @@ def test_run_purify_unconfigured_returns_unavailable(monkeypatch: pytest.MonkeyP
     assert result["available"] is False
 
 
-def test_run_purify_success_parses_json(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_run_purify_success_parses_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     upstream = tmp_path / "upstream"
     upstream.mkdir()
-    payload = {"available": True, "output": "/tmp/y.png", "device": "cpu"}
+    payload = {"available": True, "output": str(tmp_path / "y.png"), "device": "cpu"}
     captured: dict = {}
 
     def fake_run(cmd, **kwargs):
@@ -348,15 +346,10 @@ def test_run_purify_success_parses_json(
     assert "--upstream-dir" in cmd and str(upstream) in cmd
     assert captured["kwargs"]["timeout"] == 99
     if os.name == "posix":
-        assert (
-            captured["kwargs"]["preexec_fn"]
-            is image_meta.ctrlregen_subprocess_preexec_fn
-        )
+        assert captured["kwargs"]["preexec_fn"] is image_meta.ctrlregen_subprocess_preexec_fn
 
 
-def test_run_purify_runtime_error_is_reported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_run_purify_runtime_error_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     upstream = tmp_path / "upstream"
     upstream.mkdir()
 
@@ -364,16 +357,12 @@ def test_run_purify_runtime_error_is_reported(
         return SimpleNamespace(returncode=1, stdout="", stderr="boom")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    result = run_markdiffusion_purify(
-        Path("x.png"), Path("y.png"), upstream_dir=str(upstream)
-    )
+    result = run_markdiffusion_purify(Path("x.png"), Path("y.png"), upstream_dir=str(upstream))
     assert result["available"] is False
     assert "boom" in result["error"]
 
 
-def test_run_purify_prefers_venv_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_run_purify_prefers_venv_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     upstream = tmp_path / "upstream"
     if os.name == "nt":
         venv_python = upstream / ".venv" / "Scripts" / "python.exe"
@@ -388,15 +377,11 @@ def test_run_purify_prefers_venv_python(
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    run_markdiffusion_purify(
-        Path("x.png"), Path("y.png"), upstream_dir=str(upstream)
-    )
+    run_markdiffusion_purify(Path("x.png"), Path("y.png"), upstream_dir=str(upstream))
     assert captured["cmd"][0] == str(venv_python)
 
 
-def test_clean_image_diffusion_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_clean_image_diffusion_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MARKDIFFUSION_DIR", raising=False)
     monkeypatch.delenv("REVERSE_SYNTHID_DIR", raising=False)
     src = tmp_path / "t.png"
@@ -415,7 +400,7 @@ def test_clean_image_diffusion_flag(
         src,
         dest,
         remove_pixel="diffusion",
-        markdiffusion_dir="/tmp/upstream",
+        markdiffusion_dir=str(tmp_path / "upstream"),
         markdiffusion_strength=0.3,
     )
 

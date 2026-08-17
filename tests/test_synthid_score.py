@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import image_meta  # noqa: E402
-from image_meta import ImageInspectReport, run_synthid_score  # noqa: E402
+import image_meta
+from image_meta import ImageInspectReport, run_synthid_score
 
 SCORE_SCRIPT = SCRIPTS / "score_synthid.py"
 
@@ -31,6 +31,7 @@ def test_score_synthid_cli_unavailable_without_upstream(
         [sys.executable, str(SCORE_SCRIPT), str(dummy)],
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert r.returncode == 3
@@ -45,16 +46,18 @@ def test_run_synthid_score_unconfigured_returns_none(
 
 
 def test_run_synthid_score_unavailable_returns_none(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=3, stdout="", stderr="unavailable")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    assert run_synthid_score(Path("x.png"), upstream_dir="/tmp/upstream") is None
+    assert run_synthid_score(Path("x.png"), upstream_dir=str(tmp_path / "upstream")) is None
 
 
 def test_run_synthid_score_parses_json(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     payload = {
@@ -70,22 +73,23 @@ def test_run_synthid_score_parses_json(
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    result = run_synthid_score(Path("img.png"), upstream_dir="/tmp/upstream")
+    result = run_synthid_score(Path("img.png"), upstream_dir=str(tmp_path / "upstream"))
 
     assert result == payload
     assert "--json" in captured["cmd"]
     assert "--upstream-dir" in captured["cmd"]
-    assert "/tmp/upstream" in captured["cmd"]
+    assert str(tmp_path / "upstream") in captured["cmd"]
 
 
 def test_run_synthid_score_runtime_error_is_reported(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=1, stdout="", stderr="boom")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    result = run_synthid_score(Path("img.png"), upstream_dir="/tmp/upstream")
+    result = run_synthid_score(Path("img.png"), upstream_dir=str(tmp_path / "upstream"))
 
     assert result is not None
     assert result.get("available") is False

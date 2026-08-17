@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import container_meta  # noqa: E402
-from container_meta import clean_pdf  # noqa: E402
+import container_meta
+from container_meta import clean_pdf
 
 
 class _Completed:
@@ -104,7 +104,7 @@ def test_with_qpdf_the_document_is_rebuilt(monkeypatch, tmp_path: Path):
     src.write_bytes(_ai_pdf())
     seen = _fake_tools(monkeypatch, qpdf=True)
 
-    actions, meta = clean_pdf(src, dest)
+    _actions, meta = clean_pdf(src, dest)
 
     assert meta["structural_rewrite"] is True
     qpdf_cmd = [c for c in seen if c[0].endswith("qpdf")]
