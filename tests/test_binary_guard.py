@@ -175,16 +175,67 @@ def test_clean_file_in_place_as_text_on_docx_leaves_no_backup(tmp_path):
     assert not (tmp_path / "doc.docx.bak").exists()
 
 
-def test_router_advice_is_not_circular(tmp_path):
-    """clean_file.py / inspect_file.py must not point back at themselves."""
+def test_clean_file_auto_refuses_unknown_text_like_bytes(tmp_path):
+    """Extension-less bytes with no magic classify as "unknown" and are
+    refused in auto mode — even when they look like plain text, because
+    "text" is no longer the catch-all for unrecognized files."""
+    blob = tmp_path / "no_extension"
+    blob.write_text("just plain text, no extension, no magic\n", encoding="utf-8")
+    before = blob.read_bytes()
+    r = run("clean_file.py", str(blob), "--in-place")
+    assert r.returncode == 2
+    assert blob.read_bytes() == before
+    assert not (tmp_path / "no_extension.bak").exists()
+
+
+def test_clean_file_as_text_opt_in_cleans_unknown(tmp_path):
+    """--as text is the explicit opt-in that turns an unknown file into a
+    text clean."""
+    blob = tmp_path / "no_extension"
+    blob.write_text("Hidden\u200bmark here.\n", encoding="utf-8")
+    out = tmp_path / "out.txt"
+    r = run("clean_file.py", str(blob), "-o", str(out), "--as", "text")
+    assert r.returncode == 0, r.stderr
+    assert out.read_text(encoding="utf-8") == "Hiddenmark here.\n"
+
+
+def test_clean_file_force_text_opt_in_on_unknown_binary(tmp_path):
+    """--force-text also opts in, bypassing both the unknown refusal and
+    the binary guard (explicit override)."""
     blob = tmp_path / "mystery.bin"
     blob.write_bytes(b"\x00\x01\x02\x03" * 64)
-    for script in ("clean_file.py", "inspect_file.py"):
-        r = run(script, str(blob))
-        assert r.returncode == 2, script
-        assert "no supported text, image or container format" in r.stderr, script
-        assert "Use inspect_file.py / clean_file.py" not in r.stderr, script
-        assert "--force-text" in r.stderr, script
+    out = tmp_path / "out.bin"
+    r = run("clean_file.py", str(blob), "-o", str(out), "--force-text")
+    assert r.returncode == 0, r.stderr
+    assert out.exists()
+
+
+def test_inspect_file_json_reports_unknown_kind(tmp_path):
+    blob = tmp_path / "no_extension"
+    blob.write_text("no magic, no extension\n", encoding="utf-8")
+    r = run("inspect_file.py", str(blob), "--json")
+    assert r.returncode == 0
+    import json
+
+    payload = json.loads(r.stdout)
+    assert payload["kind"] == "unknown"
+    assert "note" in payload
+
+
+def test_router_advice_is_not_circular(tmp_path):
+    """clean_file.py refuses unknown bytes with router advice (never a pointer
+    back at itself); inspect_file.py reports the file as unknown instead."""
+    blob = tmp_path / "mystery.bin"
+    blob.write_bytes(b"\x00\x01\x02\x03" * 64)
+    r = run("clean_file.py", str(blob))
+    assert r.returncode == 2
+    assert "no supported text, image or container format" in r.stderr
+    assert "Use inspect_file.py / clean_file.py" not in r.stderr
+    assert "--force-text" in r.stderr
+    r = run("inspect_file.py", str(blob))
+    assert r.returncode == 0
+    assert "Kind: unknown" in r.stdout
+    assert "--as text|image|container" in r.stdout
 
 
 def test_text_only_scripts_keep_the_pointer_to_the_routers(tmp_path):

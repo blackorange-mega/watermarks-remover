@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import contextlib
 
 from audit_lib import aggregate, print_human_report, scan_file
-from common import emit_json, eprint
+from common import EXIT_PARTIAL, emit_json, eprint
 
 DEFAULT_MAX_BYTES = 4 << 20
 DEFAULT_TIMEOUT = 15
@@ -67,8 +67,11 @@ def parse_sitemap(data: bytes) -> tuple[str, list[str]]:
     elif len(data) > MAX_SITEMAP_DECOMPRESSED_BYTES:
         raise ValueError(f"sitemap size exceeds cap ({MAX_SITEMAP_DECOMPRESSED_BYTES} bytes)")
 
-    # stdlib ElementTree does not expand external entities, but internal entity
-    # expansion (billion-laughs) is still possible; reject DTDs outright.
+    # This repo is stdlib-only by policy, so sitemaps use ElementTree. stdlib
+    # ET does not expand external entities (no XXE), but internal entity
+    # expansion (billion-laughs) is still possible, so DTDs/entities are
+    # rejected outright before parsing. If the policy ever changes, swap in
+    # defusedxml.ElementTree with the same DTD rejection as defense in depth.
     if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         raise ValueError("sitemap declares a DTD / entities; refusing to parse")
 
@@ -547,7 +550,9 @@ def main() -> int:
         for failure in failures:
             print(f"  [error] {failure['url']}: {failure['error']}")
 
-    return 1 if summary["actionable_files"] else 0
+    # A partial scan (one or more URLs failed to fetch/inspect) gets a
+    # distinct code: an incomplete audit outranks actionable findings.
+    return EXIT_PARTIAL if failures else (1 if summary["actionable_files"] else 0)
 
 
 if __name__ == "__main__":

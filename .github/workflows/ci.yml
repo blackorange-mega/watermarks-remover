@@ -12,7 +12,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,6 +40,19 @@ jobs:
           python service/scripts/clean_file.py tests/fixtures/sample_ai.md -o "$env:TEMP/sample_ai.cleaned.md" &&
           python service/scripts/clean_file.py tests/fixtures/sample_ai.html -o "$env:TEMP/sample_ai.cleaned.html" &&
           python service/scripts/clean_file.py tests/fixtures/sample_meta.svg -o "$env:TEMP/sample_meta.cleaned.svg"
+
+      - name: Validate setup .ps1 scripts
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $files = @('service/scripts/setup_ctrlregen.ps1', 'service/scripts/setup_synthid.ps1')
+          foreach ($f in $files) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          }
+          $ps1 = Get-Content service/scripts/setup_ctrlregen.ps1 -Raw
+          if ($ps1 -notmatch 'cuda\.is_available\(\)') { Write-Error 'post-install CUDA verification missing'; exit 1 }
 
       - name: Audit dependencies (pip-audit)
         if: matrix.os == 'ubuntu-latest'

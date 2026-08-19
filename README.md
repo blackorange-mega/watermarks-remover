@@ -19,7 +19,7 @@ Agent skill + stdlib Python service to strip **multi-vendor AI provenance marks*
 | --- | --- | --- |
 | **A** | Invisible Unicode, exotic spaces, bidi, tag chars | Deterministic Python scripts |
 | **B** | Statistical (token-sampling) text watermarks | Agent rewrite + optional `rewrite_text.py` hook |
-| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, WebP, BMP, GIF, TIFF, SVG, PDF, DOCX, EPUB, ODT, HTML, Markdown |
+| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, WebP, AVIF, HEIC, BMP, GIF, TIFF, SVG, PDF, DOCX, XLSX, PPTX, EPUB, ODT, HTML, Markdown, MP4/MOV/M4A/M4V, WAV, MP3 |
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style marks.
 
@@ -98,6 +98,10 @@ make serve                 # http://127.0.0.1:8765
 python3 service/scripts/server.py --host 127.0.0.1 --port 8765
 ```
 
+### Windows (no Docker)
+
+See [docs/windows-autostart.md](docs/windows-autostart.md) for auto-starting the service at Windows login without Docker.
+
 For the whole infra (core + optional harness/heavy backends), see [Docker / compose](#docker--compose) below.
 
 Optional system tools (auto-used when present — preinstalled in the core Docker image):
@@ -156,6 +160,17 @@ python3 "$SCRIPTS/inspect_text.py" report.docx
 Detection is by magic number plus a control-byte ratio, so text in encodings
 other than UTF-8 keeps working. `--force-text` overrides it everywhere.
 
+### Unrecognized formats are never auto-cleaned
+
+`classify()` labels bytes that match no supported text, image or container
+format as **`unknown`** — it no longer falls back to "text". In auto mode
+`clean_file.py` refuses such files (exit 2, no output written) instead of
+decoding them as UTF-8 and writing back mangled bytes; `--as text` or
+`--force-text` are the explicit opt-ins. `inspect_file.py` reports the file
+as `unknown` (exit 0), and the HTTP service answers `/inspect` with
+`kind: "unknown"` but rejects `/clean` of unknown formats (400 — send a
+filename with a known extension, e.g. `notes.txt`).
+
 ## HTTP service
 
 The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) — the interface the skill uses and the way any web app can integrate without vendoring:
@@ -166,17 +181,48 @@ The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) �
 | GET | `/capabilities` | — | optional tools / backends present |
 | GET | `/openapi.json` | — | dynamically generated OpenAPI 3.0.3 spec |
 | POST | `/inspect` | `{"file": "<base64>", "name": "notes.md"}` | `{"ok", "kind", "suspicious", "report"}` |
+| POST | `/detect` | `{"file": "<base64>", "name": "notes.txt"}` | `{"ok", "kind", "detections": [...]}` |
 | POST | `/clean` | `{"file": "<base64>", "name": "notes.md", "options": {...}}` | `{"ok", "kind", "cleaned": "<base64>", "report"}` |
+| POST | `/inspect/batch` | `{"files": [{"file": "<base64>", "name": "notes.md"}, ...]}` | `{"ok", "results": [{"name", "ok", "kind", "suspicious", "report"}, ...]}` |
+| POST | `/clean/batch` | `{"files": [{"file": "<base64>", "name": "notes.md", "options": {...}}, ...]}` | `{"ok", "results": [{"name", "ok", "kind", "cleaned": "<base64>", "report"}, ...]}` |
+
+Batch endpoints loop the same per-file pipeline as `/inspect` and `/clean`, capped at `WATERMARKS_MAX_BATCH_FILES` files per request (default 50). A malformed entry (bad base64, unknown option, unrecognized format) surfaces as that entry's `"ok": false` with an `"error"` string — it never aborts the rest of the batch.
 
 ```bash
 WM="http://127.0.0.1:8765"
 curl -s "$WM/health"                       # {"ok": true, "version": "..."}
 curl -s "$WM/openapi.json"                 # machine-readable OpenAPI 3.0.3 contract
 curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 notes.md)\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
 ```
 
 The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request. Loopback-only bind by default (`--host` to override); intended for a trusted network.
+
+### Watermark detection (`/detect` and `detect_before` / `detect_after`)
+
+Detection is a separate step from cleaning — the service never calls vendor
+APIs unless you ask it to:
+
+- **`POST /detect`** runs the configured watermark detectors on a file.
+  Text → vendor detectors + stylometry; image → SynthID pixel score.
+- **`/inspect`** accepts an opt-in `"detect": true` flag that appends
+  detector results to the text report (and can flip `suspicious`).
+- **`/clean`** accepts `"detect_before"` / `"detect_after"` options to
+  score the input and the cleaned output, so you can measure what a clean
+  actually changed.
+
+Text detectors (see `/capabilities` → `text_detectors`):
+
+| Detector | Activated by | Notes |
+| --- | --- | --- |
+| `markllm` | `MARKLLM_DIR` (host checkout) | Research harness (KGW / SynthID schemes), same-config-only — not a vendor oracle. |
+| `claude-text` | — (placeholder) | Anthropic has announced a watermark detection API; this seam activates when it ships. |
+
+Image scoring: when `WATERMARKS_SYNTHID_SCORER_URL` is set, the service
+scores images through the `wr-synthid-score` sidecar (heavy profile); with a
+local `REVERSE_SYNTHID_DIR` it uses the checkout directly. Detection is
+fail-soft: unconfigured, timed-out, or errored detectors report
+`{"available": false, "error": ...}` and never block cleaning.
 
 ## Docker / compose
 
@@ -188,7 +234,7 @@ Published images (GHCR):
 | `…:markllm-<tag>` / `:markllm-latest` | MarkLLM text-watermark harness (Apache-2.0 upstream) | Yes |
 | `…:markdiffusion-<tag>` / `:markdiffusion-latest` | MarkDiffusion image harness (Apache-2.0 upstream) | Yes |
 | `watermarks-remover-ctrlregen:local` | CtrlRegen pixel removal — **never published** (`noai-watermark` ships no LICENSE) | Local build only |
-| `watermarks-remover-synthid-scorer:local` | reverse-SynthID scorer — **never published** (non-commercial Research License) | Local build only |
+| `watermarks-remover-synthid-scorer:local` | reverse-SynthID scorer — **never published** (non-commercial Research License) | Local build only (CLI scorer + optional `wr-synthid-score` HTTP sidecar under the `heavy` profile) |
 
 Build and run the core service:
 
@@ -226,7 +272,7 @@ Checks `wr-core` via `GET /health` and runs each harness/heavy service with `--h
 ```bash
 echo "Hello\u200bWorld\u00ad!" > /tmp/sample.txt
 curl -s -X POST http://127.0.0.1:8765/clean -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 /tmp/sample.txt)\", \"name\": \"sample.txt\"}"
+  -d "{\"file\": \"$(base64 < /tmp/sample.txt | tr -d '\n')\", \"name\": \"sample.txt\"}"
 ```
 
 Everything else is optional and lives in a `.env` file at the repo root. `docker compose` **auto-loads `.env`** and interpolates the `${VAR}` references in `compose.yaml` from it (shell exports win over `.env` if both are set).
@@ -245,6 +291,10 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | Var | Reaches | Purpose |
 | --- | --- | --- |
 | `WATERMARKS_SERVER_API_KEY` | `wr-core` (via compose `environment`) | Require `Authorization: Bearer <key>` on the HTTP API |
+| `WATERMARKS_GEMINI_*` | — | Removed Aug 2026: Google retired SynthID text watermarking on the API (see `vendor-notes.md`) |
+| `WATERMARKS_SYNTHID_SCORER_URL` | `wr-core` | Point core at the `wr-synthid-score` sidecar for SynthID image scoring (e.g. `http://wr-synthid-score:8766` under the heavy profile) |
+| `WATERMARKS_SYNTHID_SCORER_API_KEY` | `wr-core` + `wr-synthid-score` | Shared bearer key for the scorer sidecar (empty = no auth) |
+| `WATERMARKS_MARKLLM_SCHEME` | `text_detectors.py` (host) | MarkLLM scheme for `/detect`: `kgw` (default) / `synthid` |
 | `HF_TOKEN` | harness/heavy services | Hugging Face token for gated models |
 | `WATERMARKS_SERVICE_URL` | client only (skill / curl) | Where to reach the service; default `http://127.0.0.1:8765` |
 | `WATERMARKS_REWRITE_BACKEND` | `rewrite_text.py` hook | `print-prompt` (default) / `ollama` / `openai-compatible` |
@@ -308,8 +358,29 @@ docker run --rm \
 The image is built locally from the upstream source at build time. It is not
 published, so it does not redistribute the upstream code.
 
+### Option 3: HTTP scorer sidecar (docker compose)
+
+Under the `heavy` profile the compose stack also runs the scorer as an HTTP
+sidecar (`wr-synthid-score`) so the **published core service** can score
+images before/after cleaning without bundling the non-commercial upstream
+code. Point `wr-core` at it and share a bearer key (see `.env.example`):
+
+```bash
+# .env
+WATERMARKS_SYNTHID_SCORER_URL=http://wr-synthid-score:8766
+WATERMARKS_SYNTHID_SCORER_API_KEY=change-me
+
+docker compose --profile heavy up -d
+```
+
+Then `POST /clean` with `{"options": {"detect_before": true,
+"detect_after": true}}` returns `synthid_before` / `synthid_after` in the
+report, and `POST /detect` on an image returns the SynthID score. Fail-soft:
+if the sidecar is down or unconfigured, reports carry
+`{"available": false, "error": ...}` and cleaning still succeeds.
+
 V4 scoring uses `artifacts/spectral_codebook_v4.npz` from the upstream checkout
-(~220 MB). This is **detection/scoring only** — it does not remove pixel
+(`220 MB). This is **detection/scoring only** — it does not remove pixel
 watermarks.
 
 ## Optional CtrlRegen pixel removal
@@ -323,6 +394,12 @@ maintained reimplementation of the ICLR 2025
 
 The backend is **not bundled** and ships no LICENSE file, so it is treated as
 all-rights-reserved: it is cloned at a pinned commit and loaded at runtime.
+Its research-era dependency pins (`requirements-ctrlregen.txt` — e.g.
+`transformers==4.37.2`, `diffusers==0.27.2`) carry published advisories and
+are intentionally not current, so they are only ever installed inside the
+dedicated venv this script creates and never into the main service image;
+`setup_ctrlregen.sh` also re-verifies the pinned commit on existing
+checkouts, not just fresh clones.
 
 ### Bootstrap
 
@@ -339,12 +416,16 @@ NOAI_WATERMARK_DIR=~/noai-watermark \
 
 On Windows use `setup_ctrlregen.ps1` (same flags as `-Dir`, `-Ref`, `-Python`);
 the venv lands in `.venv\Scripts\`, which `clean_image.py` already resolves.
-It picks the torch wheel index from the GPU's **compute capability** rather
-than the CUDA version `nvidia-smi` prints — that number is the maximum the
-*driver* supports, and drivers are backward compatible, so deriving the wheel
-tag from it installs `cu130` on a Pascal card whose kernels were dropped in
-`cu128`. The script forces `cu126` below compute capability 7.5 and then
-verifies the result with `torch.cuda.get_arch_list()`.
+It probes the published PyTorch wheel indices and picks the highest one at or
+below the CUDA version `nvidia-smi` prints that actually exists — that number
+is the maximum the *driver* supports, and drivers are backward compatible, so a
+driver reporting 13.1 (no published `cu131`) installs `cu130`. Below compute
+capability 7.5 it forces `cu126`, the last index whose wheels still carry
+Maxwell/Pascal/Volta kernels. It installs `torch` **and** `torchvision`
+together from that index so the dependency install cannot swap them for CPU
+builds from PyPI, then verifies after install that `torch.cuda.is_available()`
+is true — if a GPU was detected but torch ends up CPU-only, the script warns
+loudly and exits non-zero instead of pretending the setup succeeded.
 
 ### From `clean_image.py`
 
@@ -443,6 +524,64 @@ MARKLLM_DIR=~/MarkLLM \
     --markllm-scheme kgw --markllm-dir "$HOME/MarkLLM" --json-stats
 ```
 
+**Detection-guided iterative rewriting:** Layer B now rewrites iteratively and
+stops as soon as an attempt passes evaluation. Each evaluation round generates
+`--candidates` variants (default **1**, `WATERMARKS_REWRITE_CANDIDATES`)
+and `--max-loops` caps how many rounds run before the best-effort variant is
+returned (default **1**, `WATERMARKS_REWRITE_LOOPS`). Each variant is one
+rewrite call plus one evaluation, and a round exits early on the first attempt
+the evaluator reports as not watermarked — so raising `--max-loops` retries
+new variants until an evaluation passes (a typical clean rewrite costs one
+attempt). The evaluator is chosen by priority:
+
+1. **MarkLLM** — same-config research detection, when `--markllm-scheme` is
+   passed (with `--markllm-dir`). A vendor-detector slot is reserved above
+   MarkLLM for Google's SynthID-text detector, which Google retired on its API
+   in Aug 2026 — a future vendor endpoint can plug in there.
+2. **bigram-Jaccard lexical divergence** — when no detector is configured; no
+   pass/fail verdict, so every attempt is generated and the most lexically
+   diverged one is selected (the original behavior).
+
+`--json-stats` reports the evaluator, attempts made, pass/fail, and per-attempt
+records:
+
+```json
+{
+  "evaluator": "markllm",
+  "candidates": 1,
+  "max_loops": 2,
+  "attempts_made": 2,
+  "passed": true,
+  "candidate_scores": [
+    {
+      "lexical_divergence": 0.91,
+      "selection_score": 0.91,
+      "selected": false,
+      "passed": false,
+      "evaluation": {"detector": "markllm", "available": true, "scheme": "kgw",
+                     "is_watermarked": true, "score": 4.3, "threshold": 3.0}
+    },
+    {
+      "lexical_divergence": 0.84,
+      "selection_score": 0.84,
+      "selected": true,
+      "passed": true,
+      "evaluation": {"detector": "markllm", "available": true, "scheme": "kgw",
+                     "is_watermarked": false, "score": 1.7, "threshold": 3.0}
+    }
+  ],
+  "markllm": {"scheme": "kgw", "before": {"...": "..."}, "after": {"...": "..."},
+              "cleared": true, "note": "same-config only"}
+}
+```
+
+A detector that is unconfigured, times out, or errors yields an
+`"available": false` entry with an `error` reason and never fails the
+rewrite — that attempt simply cannot pass, and the loop falls back to
+lexical-divergence selection. When the max is exhausted without a pass, the
+least-watermarked (lowest score) attempt is returned as best-effort with a
+note.
+
 If the backend is unconfigured or its deps are missing, the rewrite proceeds
 and the report notes verification was unavailable. A GPU is recommended; CPU
 runs work but are slow, and the model download is a few GB.
@@ -454,8 +593,8 @@ Hardening knobs:
   Custom remote code is never executed (transformers `trust_remote_code` is
   never enabled).
 - `WATERMARKS_MARKLLM_RLIMIT_AS=<bytes>` (env, POSIX) applies an address-space
-  limit to the MarkLLM subprocess spawned by `rewrite_text.py`. Off by default
-  because torch/CUDA usually needs large address spaces.
+  limit to the MarkLLM detector subprocess. Off by default because torch/CUDA
+  usually needs large address spaces.
 - Config files are capped at 1 MiB; the upstream checkout and the base image
   are pinned by SHA/digest.
 
@@ -466,6 +605,50 @@ make docker-markllm-build
 docker run --rm --user "$(id -u):$(id -g)" -v "$(pwd):/data" \
   watermarks-remover-markllm detect /data/wm.txt --scheme kgw --json
 ```
+
+## Optional SynthID-text removal benchmark
+
+[`bench_synthid_text.py`](service/scripts/bench_synthid_text.py) measures how
+effectively a Layer B rewrite clears SynthID-text-class watermarks and at
+what cost. It generates watermarked + unwatermarked samples with the MarkLLM
+SynthID scheme (same-config detection, sanity-gated), runs your rewrite
+variants (strength × max rewrite attempts; the loop stops early on pass) plus
+controls (no-removal, Layer-A-only, optional re-stamp check), and writes a
+shareable `report.md` /
+`results.json` / `results.csv`. Full guide:
+[`docs/synthid-text-benchmark.md`](docs/synthid-text-benchmark.md).
+
+Requires a MarkLLM checkout (`setup_markllm.sh` / `MARKLLM_DIR`) and a
+rewrite backend. **The rewriting model is an LLM you configure** — the same
+`rewrite_text.py` backend the skill uses. MarkLLM's default
+`facebook/opt-1.3b` (`--markllm-model`) is only the watermark
+generator/detector; it never rewrites. Configure the rewrite model via env
+vars or benchmark flags (they mirror the
+[config table](#configuration-env-vars-for-docker-compose) above):
+
+| Env var | Benchmark flag | Default | Meaning |
+| --- | --- | --- | --- |
+| `WATERMARKS_REWRITE_BACKEND` | `--rewrite-backend` | `ollama` | `ollama` or `openai-compatible` |
+| `WATERMARKS_REWRITE_MODEL` | `--rewrite-model` | *(required)* | The LLM that performs the rewrite (e.g. `llama3.2`, `deepseek-v4-flash`) |
+| `WATERMARKS_REWRITE_BASE_URL` | `--rewrite-base-url` | `http://127.0.0.1:11434` | Endpoint; the Ollama default is loopback |
+| `WATERMARKS_REWRITE_API_KEY` | `--rewrite-api-key` | — | API key (env-only in the child process, never argv) |
+| `WATERMARKS_REWRITE_ALLOW_REMOTE=1` | `--rewrite-allow-remote` | off | Required to send content to non-loopback endpoints |
+
+```bash
+# Ollama (loopback):
+python3 service/scripts/bench_synthid_text.py --markllm-dir ~/MarkLLM \
+  --rewrite-backend ollama --rewrite-model llama3.2
+
+# OpenAI-compatible API (remote):
+WATERMARKS_REWRITE_API_KEY=... python3 service/scripts/bench_synthid_text.py \
+  --markllm-dir ~/MarkLLM --rewrite-backend openai-compatible \
+  --rewrite-model deepseek-v4-flash --rewrite-base-url https://api.deepseek.com \
+  --rewrite-allow-remote
+```
+
+Use a **non-origin model** for rewriting (do not rewrite with the same
+watermarked model that generated the text) or the rewrite can re-stamp the
+output; `--restamp-control` measures this.
 
 ## Optional MarkDiffusion image-watermark harness
 
@@ -549,7 +732,7 @@ on the host instead. Model downloads still hit the HF hub on first run.
 | Channel | Claude | Gemini/SynthID | OpenAI | Open-LLM |
 | --- | --- | --- | --- | --- |
 | Unicode / edit-based text | Layer A | Layer A | Layer A | Layer A |
-| Statistical sampling text | Layer B best-effort | Layer B best-effort | Layer B if present | Layer B best-effort |
+| **Statistical sampling text** | Layer B best-effort (Claude seam when Anthropic's detection API ships) | Layer B best-effort (+ MarkLLM same-config harness; Google retired the vendor detector Aug 2026) | Layer B if present | Layer B best-effort + optional MarkLLM harness |
 | C2PA / file metadata | Yes (listed formats) | Yes when present | Yes when present | Yes when present |
 | Pixel image marks | Out of scope | Optional SynthID score + CtrlRegen removal (external); optional MarkDiffusion same-scheme detect + DiffusionPurification removal (external) | Out of scope | Optional CtrlRegen / MarkDiffusion removal (external) |
 | Training backdoors | Out of scope | Out of scope | Out of scope | Out of scope |
@@ -609,6 +792,9 @@ Layer B makes sense when you specifically want the premium model's **thinking an
 | ODT | meta.xml | Drop generator / AI-ish meta |
 | HTML | meta, JSON-LD, data-ai* | Strip tags/attrs |
 | Markdown | YAML frontmatter AI keys | Drop keys + Layer A body |
+| MP4 / MOV / M4A / M4V | ISOBMFF `jumb`/`uuid` boxes (same mechanism as AVIF/HEIC) + `moov/udta` generator tags | Drop boxes |
+| WAV | RIFF `LIST INFO` chunk, embedded `id3 ` chunk | Drop chunks |
+| MP3 | ID3v2 frames (v2.3/v2.4 per-frame; v2.2 whole-tag) | Drop matched frames or whole tag |
 
 #### Why PDF needs qpdf, not just exiftool
 
@@ -681,6 +867,22 @@ Third-party projects that wrap or complement this repository, listed for discove
 
 To register a project here, open a PR adding a short entry — project name, what it wraps or adds, and a link to its own repository. Keep entries brief and factual; do not claim compatibility with, or endorsement by, this project. Please avoid names that start with or closely resemble `watermarks-remover` — look-alike names make it hard to tell which project is which.
 
+## Pre-commit hook
+
+CI gating already exists (`audit_dir.py`'s SARIF export, see [Coverage matrix](#coverage-matrix) context) — the [pre-commit](https://pre-commit.com/) hooks below catch the same class of problem earlier, before a marked file is even committed. Both wrap the existing CLIs (`audit_dir.py` / `clean_file.py`) — no separate detection logic.
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/guillaumemeyer/watermarks-remover
+    rev: v0.5.0   # pin to a tag/commit
+    hooks:
+      - id: watermarks-remover-check   # fails the commit if marks are found
+      # - id: watermarks-remover-clean # opt-in: cleans staged files in place instead
+```
+
+`watermarks-remover-check` fails the commit and lists findings; `watermarks-remover-clean` is opt-in and rewrites staged files in place (exits non-zero so you review the diff and re-stage — the same convention as auto-fixing hooks like `ruff --fix`). Run either by hand with `python3 service/scripts/check_staged.py <files...>` / `clean_staged.py <files...>`.
+
 ## Tests
 
 ```bash
@@ -690,6 +892,24 @@ make smoke                          # quick CLI smoke on fixtures
 ```
 
 ## Changelog
+
+### Unreleased — detection-guided iterative Layer B rewriting
+
+- **Layer B rewriting is now iterative and evaluation-driven**: each round
+  generates `--candidates` variants (default 1,
+  `WATERMARKS_REWRITE_CANDIDATES`) and `--max-loops` (default 1,
+  `WATERMARKS_REWRITE_LOOPS`) caps the evaluation rounds, stopping as soon
+  as an attempt passes watermark detection. Evaluator priority: MarkLLM (when
+  `--markllm-scheme`) > bigram-Jaccard lexical divergence (fallback; a
+  vendor-detector seam is reserved for a future SynthID-text endpoint).
+- `rewrite_text.py --json-stats` now reports `evaluator` /
+  `max_loops` / `attempts_made` / `passed` and per-attempt
+  `candidate_scores` records (`loop`, `passed`, `evaluation`);
+  `markllm.before/after/cleared` is unchanged.
+- **SynthID-text benchmark**: default variants `paraphrase:3`; report and CSV
+  now carry attempts per document (`mean_attempts`, `att` column;
+  `attempts` / `evaluator` / `passed` columns); `--rewrite-loops`
+  mirrors `--max-loops`.
 
 ### [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0) — service & Docker distribution, HTTP API, and verification harnesses
 
@@ -716,7 +936,7 @@ make smoke                          # quick CLI smoke on fixtures
 **MarkLLM text-watermark harness (optional)**
 
 - New optional harness (external `THU-BPM/MarkLLM` checkout, Apache-2.0): `detect_text_watermark.py` with `detect` / `watermark` subcommands for KGW and SynthID schemes
-- `rewrite_text.py --markllm-scheme` runs before/after detection around a Layer B rewrite (env-gated; reports `cleared`)
+- `rewrite_text.py --markllm-scheme` runs before/after detection around a Layer B rewrite and per-candidate detection when `--candidates N>1` (env-gated; reports `cleared`)
 - `setup_markllm.sh` bootstrap + `requirements-markllm.txt` (pinned deps) + `Dockerfile.markllm` and Makefile `bootstrap-markllm` / `smoke-markllm` / `docker-markllm-build` / `docker-markllm-help`
 - Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, optional `WATERMARKS_MARKLLM_RLIMIT_AS` on the rewrite subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
 - Mock-based tests (`tests/test_markllm_detect.py`, 21 cases) — no torch in CI; verification-harness caveat (same-config-only, not a vendor-detector oracle) documented in README, SKILL.md, `removal-matrix.md`, `vendor-notes.md`
@@ -843,7 +1063,9 @@ MIT — see [LICENSE](LICENSE).
 - Kirchenbauer et al., [*A Watermark for Large Language Models*](https://arxiv.org/abs/2301.10226)
 - [THU-BPM/MarkLLM](https://github.com/THU-BPM/MarkLLM) (unified toolkit for evaluating LLM watermarking algorithms)
 - Pan et al., [*MarkDiffusion: An Open-Source Toolkit for Generative Watermarking of Latent Diffusion Models*](https://arxiv.org/abs/2509.10569) (JMLR) — the embedding toolkit this repo's optional image-watermark harness wraps — [code](https://github.com/THU-BPM/MarkDiffusion), [docs](https://markdiffusion.readthedocs.io)
-- Zhang et al., [*Watermarks in the Sand: Impossibility of Strong Watermarking for Generative Models*](https://arxiv.org/abs/2311.04378) (ICML 2024)
+- Zhang et al., [*Watermarks in the Sand: Impossibility of Strong Watermarking for Generative Models*](https://arxiv.org/abs/2311.04378v5) (ICML 2024)
+- Sander et al., [*Watermarking Makes Language Models Radioactive*](https://arxiv.org/abs/2402.14904) — watermarks survive fine-tuning and mark downstream models trained on watermarked data
+- Pan et al., [*Can LLM Watermarks Robustly Prevent Unauthorized Knowledge Distillation?*](https://arxiv.org/abs/2502.11598) — watermark-based provenance and protection against knowledge distillation
 - [google-deepmind/synthid-text](https://github.com/google-deepmind/synthid-text) (research reference; not used for detection here)
 - [aloshdenny/reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) (research reference)
 - Liu et al., [*Image Watermarks are Removable Using Controllable Regeneration from Clean Noise*](https://arxiv.org/abs/2410.05470) (ICLR 2025) — the pixel-regeneration method the optional CtrlRegen backend implements — [code](https://github.com/yepengliu/CtrlRegen)

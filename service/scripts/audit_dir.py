@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from audit_lib import aggregate, format_sarif, print_human_report, scan_file
-from common import MAX_INPUT_BYTES, emit_json, eprint
+from common import EXIT_PARTIAL, MAX_INPUT_BYTES, emit_json, eprint
 
 DEFAULT_SKIP_DIRS = {
     ".git",
@@ -156,7 +156,10 @@ def main() -> int:
             },
         )
 
-    return 1 if summary["actionable_files"] else 0
+    # A partial scan (one or more files could not be scanned) is reported
+    # with a distinct code in every output format: incomplete audits are
+    # the more important CI signal and take precedence over actionable.
+    return EXIT_PARTIAL if skipped else (1 if summary["actionable_files"] else 0)
 
 
 if __name__ == "__main__":

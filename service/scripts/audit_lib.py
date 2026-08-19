@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from av_meta import inspect_av
 from common import CONFIDENCE_LEVELS, classify_finding_confidence
 from container_meta import inspect_container
 from format_dispatch import classify
@@ -82,6 +83,31 @@ def scan_file(
             "findings": report.findings,
             "confidence": [classify_finding_confidence(f) for f in report.findings],
             "notes": report.notes,
+        }
+
+    if kind == "av":
+        av_report = inspect_av(path)
+        return {
+            "path": name,
+            "kind": av_report.format,
+            "has_c2pa": av_report.has_c2pa,
+            "has_ai_metadata": av_report.has_ai_metadata,
+            "suspicious_total": 0,
+            "findings": av_report.findings,
+            "confidence": [classify_finding_confidence(f) for f in av_report.findings],
+            "notes": av_report.notes,
+        }
+
+    if kind == "unknown":
+        return {
+            "path": name,
+            "kind": "unknown",
+            "has_c2pa": False,
+            "has_ai_metadata": False,
+            "suspicious_total": 0,
+            "findings": [],
+            "confidence": [],
+            "notes": ["unrecognized format; not scanned"],
         }
 
     report = inspect_container(path)

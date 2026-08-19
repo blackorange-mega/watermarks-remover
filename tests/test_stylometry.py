@@ -42,8 +42,9 @@ def test_sentence_and_word_extraction():
 
 def test_burstiness_variance():
     # Empty / single sentence edge cases
-    assert compute_burstiness([]) == (0.0, 0.0, 0.0)
+    assert compute_burstiness([]) == (0.0, 0.0, None)
     assert compute_burstiness(["Only one sentence here."])[1] == 0.0
+    assert compute_burstiness(["Only one sentence here."])[2] is None
 
     # Uniform sentences (every sentence is 5 words) -> CV should be 0.0
     uniform = [

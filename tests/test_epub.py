@@ -197,3 +197,41 @@ def test_clean_epub_keeps_plain_creator():
         opf = zf.read("OEBPS/content.opf").decode("utf-8")
     assert "Jane Doe" in opf
     assert not any("creator" in a for a in actions)
+
+
+def test_clean_epub_prunes_opf_manifest_for_dropped_part():
+    """A dropped non-content part must also lose its <item> entry (and any
+    spine itemref) in the OPF manifest, or the book fails EPUB validation."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr(
+            "META-INF/container.xml",
+            '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>',
+        )
+        zf.writestr(
+            "OEBPS/content.opf",
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+            "<manifest>"
+            '<item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="m1" href="../META-INF/custommeta.xml" media-type="application/xml"/>'
+            "</manifest>"
+            '<spine><itemref idref="c1"/></spine>'
+            "</package>",
+        )
+        zf.writestr("OEBPS/chapter1.xhtml", "<html><body><p>hi</p></body></html>")
+        zf.writestr(
+            "META-INF/custommeta.xml",
+            '<metadata xmlns="http://www.idpf.org/2013/metadata">Anthropic Claude</metadata>',
+        )
+    data = buf.getvalue()
+
+    cleaned, actions = clean_epub(data)
+    assert any("drop part META-INF/custommeta.xml" in a for a in actions)
+    assert any("prune OPF manifest entries" in a for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        assert "META-INF/custommeta.xml" not in zf.namelist()
+        opf = zf.read("OEBPS/content.opf").decode("utf-8")
+        assert "custommeta.xml" not in opf
+        assert 'id="c1"' in opf

@@ -27,6 +27,9 @@ services:
     environment:
       # Empty by default (no auth). Set to require `Authorization: Bearer <key>`.
       WATERMARKS_SERVER_API_KEY: ${WATERMARKS_SERVER_API_KEY:-}
+      # Optional SynthID image scorer sidecar (heavy profile).
+      WATERMARKS_SYNTHID_SCORER_URL: ${WATERMARKS_SYNTHID_SCORER_URL:-}
+      WATERMARKS_SYNTHID_SCORER_API_KEY: ${WATERMARKS_SYNTHID_SCORER_API_KEY:-}
     read_only: true
     tmpfs:
       - /tmp
@@ -51,8 +54,22 @@ services:
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
       HF_HOME: /home/markllm/.cache/huggingface
+      # Layer B rewrite backend (openai-compatible / ollama).
+      WATERMARKS_REWRITE_BACKEND: ${WATERMARKS_REWRITE_BACKEND:-}
+      WATERMARKS_REWRITE_MODEL: ${WATERMARKS_REWRITE_MODEL:-}
+      WATERMARKS_REWRITE_BASE_URL: ${WATERMARKS_REWRITE_BASE_URL:-}
+      WATERMARKS_REWRITE_API_KEY: ${WATERMARKS_REWRITE_API_KEY:-}
+      WATERMARKS_REWRITE_ALLOW_REMOTE: ${WATERMARKS_REWRITE_ALLOW_REMOTE:-}
+      WATERMARKS_REWRITE_REASONING_EFFORT: ${WATERMARKS_REWRITE_REASONING_EFFORT:-}
     volumes:
       - markllm-cache:/home/markllm/.cache/huggingface
+      # Writable output for the benchmark + the bundled seed corpus (the
+      # build context is service/, so the corpus is mounted at runtime):
+      #   docker compose run --rm wr-markllm \
+      #     /app/bench_synthid_text.py --markllm-dir /opt/markllm \
+      #     --corpus /bench-corpus --out-dir /data ...
+      - bench-out:/data
+      - ./benchmarks/corpus:/bench-corpus:ro
 
   wr-markdiffusion:
     profiles: [harness]
@@ -109,8 +126,32 @@ services:
     volumes:
       - synthid-cache:/home/scorer/.cache/huggingface
 
+  # HTTP SynthID scorer sidecar: lets wr-core score images before/after
+  # cleaning without bundling the non-commercial reverse-SynthID code in the
+  # published core image. Reach it via WATERMARKS_SYNTHID_SCORER_URL on
+  # wr-core (see .env.example) and require the same bearer key on both sides.
+  wr-synthid-score:
+    profiles: [heavy]
+    build:
+      context: service
+      dockerfile: Dockerfile.synthid
+    image: watermarks-remover-synthid-scorer:local
+    entrypoint: ["python3"]
+    command: ["/app/synthid_score_server.py", "--host", "0.0.0.0", "--port", "8766"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    user: "10001:10001"
+    environment:
+      WATERMARKS_SYNTHID_SCORER_API_KEY: ${WATERMARKS_SYNTHID_SCORER_API_KEY:-}
+      REVERSE_SYNTHID_DIR: /opt/reverse-synthid
+    volumes:
+      - synthid-cache:/home/scorer/.cache/huggingface
+
 volumes:
   markllm-cache:
+  bench-out:
   markdiffusion-cache:
   ctrlregen-cache:
   synthid-cache:

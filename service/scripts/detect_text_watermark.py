@@ -26,8 +26,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
+import socketserver
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -143,6 +147,42 @@ def _resolve_config(upstream: Path, alg: str, config: str | None) -> Path:
     return path
 
 
+def _generate(
+    wm: Any,
+    prompt: str,
+    seed: int | None,
+    max_new_tokens: int,
+    min_length: int = 0,
+    need_unwatermarked: bool = True,
+) -> tuple[str, str | None]:
+    """Generate watermarked (and optionally unwatermarked) text for *prompt*."""
+    if seed is not None:
+        import torch
+
+        torch.manual_seed(seed)
+    wm.config.gen_kwargs["max_new_tokens"] = max_new_tokens
+    wm.config.gen_kwargs["min_length"] = min_length
+    watermarked = wm.generate_watermarked_text(prompt)
+    unwatermarked = wm.generate_unwatermarked_text(prompt) if need_unwatermarked else None
+    return watermarked, unwatermarked
+
+
+def _detect_payload(wm: Any, text: str, threshold: float | None) -> dict[str, Any]:
+    """Same-config detection payload (is_watermarked/score/threshold)."""
+    result = wm.detect_watermark(text, return_dict=True)
+    is_watermarked = bool(result.get("is_watermarked", False))
+    score = result.get("score")
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "is_watermarked": is_watermarked,
+        "score": score,
+        "threshold": threshold,
+    }
+
+
 def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     if args.path != "-" and not Path(args.path).is_file():
         eprint(f"not a file: {args.path}")
@@ -155,7 +195,7 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
         config = _resolve_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
         wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
-        result = wm.detect_watermark(text, return_dict=True)
+        det = _detect_payload(wm, text, threshold)
     except _Unavailable as e:
         eprint(str(e))
         return 3
@@ -163,12 +203,8 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
         eprint(f"detection error: {e}")
         return 1
 
-    is_watermarked = bool(result.get("is_watermarked", False))
-    score = result.get("score")
-    try:
-        score = float(score)
-    except (TypeError, ValueError):
-        score = None
+    is_watermarked = det["is_watermarked"]
+    score = det["score"]
 
     payload = {
         "available": True,
@@ -201,16 +237,14 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     try:
         config = _resolve_config(upstream, alg, args.config)
         wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
-        if args.seed is not None:
-            import torch
-
-            torch.manual_seed(args.seed)
-        wm.config.gen_kwargs["max_new_tokens"] = args.max_new_tokens
-        wm.config.gen_kwargs["min_length"] = args.min_length
-        watermarked = wm.generate_watermarked_text(prompt)
-        unwatermarked = None
-        if args.unwatermarked_output:
-            unwatermarked = wm.generate_unwatermarked_text(prompt)
+        watermarked, unwatermarked = _generate(
+            wm,
+            prompt,
+            args.seed,
+            args.max_new_tokens,
+            args.min_length,
+            need_unwatermarked=bool(args.unwatermarked_output),
+        )
     except _Unavailable as e:
         eprint(str(e))
         return 3
@@ -245,7 +279,148 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
                 f"      unwatermarked sample ({payload['unwatermarked_chars']} chars) -> {args.unwatermarked_output}"
             )
 
+
+def _handle_serve_request(wm: Any, req: dict[str, Any], threshold: float | None) -> dict[str, Any]:
+    """Handle one JSON-lines request; never raises (responds with ok:false)."""
+    rid = req.get("id")
+    op = req.get("op")
+    if op == "exit":
+        return {"ok": True, "id": rid}
+    try:
+        if op == "watermark":
+            prompt = req.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError("'prompt' must be a non-empty string")
+            watermarked, unwatermarked = _generate(
+                wm,
+                prompt,
+                req.get("seed"),
+                req.get("max_new_tokens", 200),
+                req.get("min_length", 0),
+                need_unwatermarked=True,
+            )
+            return {
+                "ok": True,
+                "id": rid,
+                "watermarked": watermarked,
+                "unwatermarked": unwatermarked,
+                "watermarked_chars": len(watermarked),
+                "unwatermarked_chars": len(unwatermarked),
+            }
+        if op == "detect":
+            text = req.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError("'text' must be a non-empty string")
+            det = _detect_payload(wm, text, threshold)
+            return {"ok": True, "id": rid, **det}
+        return {"ok": False, "id": rid, "error": f"unknown op {op!r}"}
+    except Exception as e:  # a bad request must not kill the worker
+        return {"ok": False, "id": rid, "error": str(e)}
+
+
+def _cmd_serve(args: argparse.Namespace, upstream: Path, alg: str) -> int:
+    """Serve watermark/detect requests over JSON-lines stdin/stdout.
+
+    Loads the MarkLLM model once and keeps it resident so callers (e.g. the
+    SynthID-text benchmark) can run many operations without paying the
+    torch + model load cost per call. Protocol:
+
+      request:  {"op": "watermark", "id": N, "prompt": str, "seed": int|None,
+                 "max_new_tokens": int, "min_length": int}
+                {"op": "detect", "id": N, "text": str}
+                {"op": "exit", "id": N}
+      response: {"ok": true, "id": N, ...} | {"ok": false, "id": N, "error": str}
+
+    The first stdout line is a {"ready": true, ...} handshake emitted after
+    model load. Errors on one request never kill the worker.
+    """
+    device = resolve_device(args.device)
+    try:
+        config = _resolve_config(upstream, alg, args.config)
+        threshold = _threshold_from_config(config)
+        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
+    except _Unavailable as e:
+        eprint(str(e))
+        return 3
+    except Exception as e:
+        eprint(f"serve load error: {e}")
+        return 1
+
+    def respond(payload: dict[str, Any]) -> None:
+        print(json.dumps(payload), flush=True)
+
+    ready: dict[str, Any] = {"ready": True, "scheme": alg, "model": args.model, "device": device}
+    lock = threading.Lock()
+    server: socketserver.ThreadingTCPServer | None = None
+    if args.port >= 0:
+        # Loopback TCP listener so other processes (e.g. the rewrite
+        # subprocess's MarkLLM detector) can reuse this resident model
+        # instead of cold-starting their own. Port 0 = ephemeral.
+        server = _serve_socket_server(wm, threshold, args.port, lock)
+        ready["port"] = server.server_address[1]
+    respond(ready)
+
+    try:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                respond({"ok": False, "error": "invalid JSON request"})
+                continue
+            if not isinstance(req, dict):
+                respond({"ok": False, "error": "request must be a JSON object"})
+                continue
+            with lock:
+                resp = _handle_serve_request(wm, req, threshold)
+            respond(resp)
+            if req.get("op") == "exit":
+                return 0
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
     return 0
+
+
+def _serve_socket_server(
+    wm: Any, threshold: float | None, port: int, lock: threading.Lock
+) -> socketserver.ThreadingTCPServer:
+    """A loopback JSON-lines TCP server sharing this process's model."""
+
+    class _Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            f = self.request.makefile("r", encoding="utf-8")
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    req = json.loads(line)
+                    if not isinstance(req, dict):
+                        raise ValueError("request must be a JSON object")
+                except (json.JSONDecodeError, ValueError):
+                    resp: dict[str, Any] = {"ok": False, "error": "invalid JSON request"}
+                else:
+                    with lock:
+                        resp = _handle_serve_request(wm, req, threshold)
+                try:
+                    self.request.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                except OSError:
+                    return
+                if isinstance(req, dict) and req.get("op") == "exit":
+                    return
+
+    class _Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    _Server.address_family = socket.AF_INET
+    srv = _Server(("127.0.0.1", port), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -319,6 +494,19 @@ def main() -> int:
     _add_common(wm)
     wm.add_argument("--json", action="store_true", help="Emit JSON on stdout")
     wm.set_defaults(handler=_cmd_watermark)
+
+    serve = sub.add_parser(
+        "serve", help="Serve watermark/detect over JSON-lines stdin (persistent worker)"
+    )
+    _add_common(serve)
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=-1,
+        help="Also listen on 127.0.0.1:PORT (JSON-lines; 0 = ephemeral) for "
+        "other processes to reuse this resident model (default: no listener)",
+    )
+    serve.set_defaults(handler=_cmd_serve)
 
     args = p.parse_args()
 

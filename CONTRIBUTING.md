@@ -49,10 +49,10 @@ issue.
 2. **Layer B (statistical rewrite)** — guidance in `SKILL.md` plus optional
    `rewrite_text.py` (print-prompt default; ollama / openai-compatible). No
    bundled model. Keep ethics-aware.
-3. **Files (C2PA / EXIF / XMP / props)** — `image_meta.py` (PNG/JPEG),
-   `container_meta.py` (SVG/PDF/DOCX/ODT/HTML/MD), unified
-   `inspect_file.py` / `clean_file.py`. Preserve document body / pixels;
-   strip provenance metadata only.
+3. **Files (C2PA / EXIF / XMP / props)** — `image_meta.py` (PNG/JPEG/AVIF/HEIC/...),
+   `container_meta.py` (SVG/PDF/DOCX/ODT/HTML/MD), `av_meta.py` (MP4/MOV/WAV/MP3),
+   unified `inspect_file.py` / `clean_file.py`. Preserve document body / pixels /
+   waveform; strip provenance metadata only.
 
 ## Checklist for a change
 

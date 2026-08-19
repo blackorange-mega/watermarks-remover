@@ -2,6 +2,7 @@
 	smoke-ctrlregen bootstrap-ctrlregen docker-ctrlregen-build docker-ctrlregen-help \
 	smoke-markllm bootstrap-markllm docker-markllm-build docker-markllm-help \
 	smoke-markdiffusion bootstrap-markdiffusion docker-markdiffusion-build docker-markdiffusion-help \
+	bench-synthid-text \
 	docker-core-build docker-core-help serve compose-up compose-up-heavy compose-check \
 	install-skill install-cursor-text-skill clean
 
@@ -83,6 +84,11 @@ smoke-markdiffusion:
 	  echo "smoke-markdiffusion skipped (set MARKDIFFUSION_DIR)"; \
 	else \
 	  $(PYTHON) $(SCRIPTS)/markdiffusion_harness.py --help >/dev/null && echo "markdiffusion_harness adapter present"; \
+bench-synthid-text:
+	@if [ -z "$(MARKLLM_DIR)" ]; then \
+	  echo "bench-synthid-text skipped (set MARKLLM_DIR; see docs/synthid-text-benchmark.md)"; \
+	else \
+	  echo "run: $(PYTHON) $(SCRIPTS)/bench_synthid_text.py --markllm-dir $(MARKLLM_DIR) --rewrite-model <model> --rewrite-backend <backend>"; \
 	fi
 
 bootstrap-markdiffusion:

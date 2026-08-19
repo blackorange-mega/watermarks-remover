@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from av_meta import clean_av
 from common import (
     MAX_INPUT_BYTES,
     ROUTER_ADVICE,
@@ -36,12 +37,12 @@ def main() -> int:
     p.add_argument(
         "--keep-non-ai-metadata",
         action="store_true",
-        help="Images: only drop C2PA/AI-looking segments",
+        help="Images/audio/video: only drop C2PA/AI-looking segments",
     )
     p.add_argument(
         "--as",
         dest="force_type",
-        choices=("auto", "text", "image", "container"),
+        choices=("auto", "text", "image", "container", "av"),
         default="auto",
     )
     p.add_argument(
@@ -60,6 +61,19 @@ def main() -> int:
         return 2
 
     kind = args.force_type if args.force_type != "auto" else classify(args.path)
+
+    # classify() reports "unknown" for bytes that match no supported format.
+    # Never mutate those in auto mode: a binary with valid UTF-8 runs would
+    # be decoded and written back mangled. --as text / --force-text are the
+    # explicit opt-ins and both route through the text pipeline below.
+    if kind == "unknown":
+        if args.force_type == "text" or args.force_text:
+            kind = "text"
+        else:
+            eprint(f"refusing to classify {args.path}: unrecognized format")
+            for line in ROUTER_ADVICE:
+                eprint(line)
+            return 2
 
     # In-place cleaning reads from a .bak copy whose suffix would make
     # markdown/HTML (detected by extension, not magic bytes) classify as
@@ -124,6 +138,28 @@ def main() -> int:
             eprint(f"error: {e}")
             return 1
         result = {"kind": "image", **result}
+        residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            eprint(f"wrote {result['output']} ({result['bytes_in']} -> {result['bytes_out']})")
+            for a in result["actions"]:
+                eprint(f"  - {a}")
+            if residual:
+                eprint("warning: residual C2PA/AI signals may remain")
+        return 1 if residual else 0
+
+    if kind == "av":
+        try:
+            result = clean_av(
+                src,
+                dest,
+                strip_all_metadata=not args.keep_non_ai_metadata,
+            )
+        except Exception as e:
+            eprint(f"error: {e}")
+            return 1
+        result = {"kind": "av", **result}
         residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
         if args.json:
             print(json.dumps(result, indent=2))

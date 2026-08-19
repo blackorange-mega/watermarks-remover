@@ -17,8 +17,10 @@
 # Pinned upstream commit (2026-07-10). Keep in sync with setup_markllm.sh.
 ARG MARKLLM_REF=c45ddc40f7b761beabe55a1b8dc4690e531d1c6d
 
-# python:3.14-slim linux/amd64 digest.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
+# Default: python:3.14-slim linux/amd64 digest (published image). GPU/arm64
+# builds override with --build-arg BASE_IMAGE=<digest for the target arch>.
+ARG BASE_IMAGE=python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
+FROM ${BASE_IMAGE}
 
 ARG MARKLLM_REF
 
@@ -40,6 +42,7 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
         '/config/' \
         '/utils/' \
         '/exceptions/' \
+        '/visualize/' \
         '/evaluation/dataset.py' \
         '/LICENSE' \
         '/README.md' \
@@ -48,12 +51,18 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
 COPY scripts/requirements-markllm.txt /app/requirements-markllm.txt
 COPY scripts/detect_text_watermark.py /app/detect_text_watermark.py
 COPY scripts/common.py /app/common.py
+# Benchmark + Layer B rewrite machinery (all stdlib; no extra deps).
+COPY scripts/bench_synthid_text.py /app/bench_synthid_text.py
+COPY scripts/rewrite_text.py /app/rewrite_text.py
+COPY scripts/text_detectors.py /app/text_detectors.py
+COPY scripts/text_unicode.py /app/text_unicode.py
 
-# torch is installed first from the CPU index (like Dockerfile.markdiffusion);
-# the remaining pinned deps then resolve against it. No GPU wheel index inside
-# the image — CUDA users should run setup_markllm.sh on the host instead.
+# Default: CPU torch (like Dockerfile.markdiffusion). CUDA users build with
+# --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cuXXX and run
+# with --gpus all.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN python3 -m pip install --no-cache-dir "pip==26.2.1" \
-    && python3 -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch>=2.13,<2.14" \
+    && python3 -m pip install --no-cache-dir --index-url "${TORCH_INDEX_URL}" "torch>=2.13,<2.14" \
     && python3 -m pip install --no-cache-dir -r /app/requirements-markllm.txt
 
 # Unprivileged runtime user. The harness only reads input files and writes to

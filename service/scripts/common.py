@@ -16,6 +16,12 @@ from typing import Any
 MAX_INPUT_BYTES = int(os.environ.get("WATERMARKS_MAX_INPUT_BYTES", str(256 << 20)))
 MAX_STDIN_BYTES = int(os.environ.get("WATERMARKS_MAX_STDIN_BYTES", str(64 << 20)))
 
+# Exit codes shared by the audit CLIs. 0 = clean, 1 = actionable findings,
+# 2 = usage/refusal error, 3 = partial scan (some files/URLs failed to
+# scan). A partial scan takes precedence over actionable findings: an
+# incomplete audit is the more important CI signal.
+EXIT_PARTIAL = 3
+
 # Child-process resource limits (address space / output file size). Applied
 # via preexec_fn so a crafted file cannot make exiftool/c2patool/OpenCV
 # exhaust host memory or fill the disk.

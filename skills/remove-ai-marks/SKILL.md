@@ -56,10 +56,13 @@ curl -s "$WM/capabilities"
 ```
 
 Reports which optional tools are available server-side (`c2patool`, `exiftool`,
-`qpdf`), scorers present (`scorers.stylometry`, `scorers.synthid`), and which heavy
-backends are configured (`pixel_backends.ctrlregen`, `pixel_backends.diffusion`,
-`harnesses.markllm`). **Drive your advice from this**: only recommend pixel
-removal / SynthID scoring when the service reports the backend present.
+`qpdf`), scorers present (`scorers.stylometry`, `scorers.synthid`,
+`scorers.synthid_http`), text-watermark detectors
+(`text_detectors.markllm`,
+`text_detectors.claude-text`), and which heavy backends are configured
+(`pixel_backends.ctrlregen`, `pixel_backends.diffusion`, `harnesses.markllm`).
+**Drive your advice from this**: only recommend pixel removal / SynthID
+scoring / vendor detection when the service reports the backend present.
 
 ## HTTP API (curl)
 
@@ -72,7 +75,13 @@ field and writes it to the output path itself.
 | GET | `/capabilities` | — | optional tools / backends present |
 | GET | `/openapi.json` | — | dynamically generated OpenAPI 3.0.3 spec |
 | POST | `/inspect` | `{"file": "<base64>", "name": "notes.md"}` | `{"ok", "kind", "suspicious", "report"}` |
+| POST | `/detect` | `{"file": "<base64>", "name": "notes.txt"}` | `{"ok", "kind", "detections": [...]}` |
 | POST | `/clean` | `{"file": "<base64>", "name": "notes.md", "options": {...}}` | `{"ok", "kind", "cleaned": "<base64>", "report"}` |
+
+`/clean` and `/inspect` route by the uploaded `name` extension plus the bytes;
+unrecognized formats answer `kind: "unknown"` (`/inspect`) or 400 (`/clean`).
+When writing a temp file for pasted text, keep a known extension (`.txt` /
+`.md`) in the `name` you send.
 
 The machine-readable contract lives at `$WM/openapi.json` — plug it into any
 OpenAPI tooling (client generators, Swagger UI, editors) instead of hand-rolling
@@ -80,20 +89,22 @@ clients.
 
 `options` accepted by `/clean`: `nfkc`, `aggressive_homoglyphs` (text),
 `keep_non_ai_metadata`, `strip_all_metadata`, `remove_pixel` (`ctrlregen` |
-`diffusion`) (images), `also_layer_a_text` (containers).
+`diffusion`) (images), `also_layer_a_text` (containers), `detect_before` /
+`detect_after` (text and images: run watermark detection on the input and on
+the cleaned output, included in the report).
 
 **Inspect first** (decide, don't guess):
 
 ```bash
 curl -s -X POST "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 notes.md)\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
 ```
 
 **Clean** (text / image / container are auto-detected by name + bytes):
 
 ```bash
 curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 notes.md)\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
 ```
 
 Decode the returned `cleaned` base64 into the output file (`*.cleaned.*` by
@@ -126,7 +137,7 @@ mostly just send the file.
 
 ```bash
 curl -s -X POST "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 path)\", \"name\": \"$(basename path)\"}"
+  -d "{\"file\": \"$(base64 < path | tr -d '\n')\", \"name\": \"$(basename path)\"}"
 ```
 
 Show a short summary (suspicious codepoints; C2PA/AI flags; confidence labels
@@ -138,13 +149,31 @@ external heavy backends. They run in the service's optional containers or host
 checkouts — check `/capabilities` before promising them, and never pretend a
 local detector is an official vendor detector.
 
+### 2b. Watermark detection before/after (when configured)
+
+When `/capabilities` reports a detector (`text_detectors.markllm`) or an image
+scorer (`scorers.synthid_http` / `scorers.synthid`), measure the result by
+detecting before and after cleaning:
+
+```bash
+curl -s -X POST "$WM/detect" -H 'Content-Type: application/json' \
+  -d '{"file": "'"$(base64 -w0 notes.txt)"'", "name": "notes.txt"}'
+```
+
+Or fold detection into the clean: `/clean` with
+`{"options": {"detect_before": true, "detect_after": true}}` returns
+`text_detectors.before/after` (text) or `synthid_before/synthid_after`
+(images) in the report. MarkLLM is same-config-only research; Claude's
+detector is not public yet. (Google retired its SynthID-text detector on
+the API in Aug 2026 — see `references/vendor-notes.md`.)
+
 ### 3. Deterministic clean (always for matching inputs)
 
 **Any supported file (unified):**
 
 ```bash
 curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 INPUT)\", \"name\": \"$(basename INPUT)\"}"
+  -d "{\"file\": \"$(base64 < INPUT | tr -d '\n')\", \"name\": \"$(basename INPUT)\"}"
 ```
 
 Decode `cleaned` → `OUTPUT` (`*.cleaned.*` unless the user asked in-place).
@@ -158,7 +187,7 @@ says the backend is present:
 
 ```bash
 curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 -w0 shot.png)\", \"name\": \"shot.png\", \
+  -d "{\"file\": \"$(base64 < shot.png | tr -d '\n')\", \"name\": \"shot.png\", \
        \"options\": {\"remove_pixel\": \"ctrlregen\"}}"
 ```
 
@@ -259,6 +288,11 @@ docker run --rm -v "$(pwd)/src:/data:ro" watermarks-remover \
 
 Or against a local checkout of the repo: `python3 service/scripts/audit_dir.py DIR --json`.
 
+Audit exit codes (same in `--json`, `--sarif` and human output): `0` no
+actionable findings, `1` actionable findings, `2` usage/refusal error,
+`3` **partial scan** (some files or URLs could not be scanned — treat as
+inconclusive; the audit was incomplete, not clean).
+
 ### 5. Report
 
 Always state:
@@ -276,7 +310,7 @@ Always state:
 - Layer B cannot be gold-verified without vendor detectors / keys. Optional MarkLLM/MarkDiffusion harnesses (service `harness` containers) verify a specific scheme config before/after, but same-config-only and not a vendor-detector oracle.
 - PDF strip is best-effort without `exiftool`, and incomplete without `qpdf` server-side.
 - Pixel-domain **image** watermarks can be removed optionally via the external CtrlRegen backend (`remove_pixel: ctrlregen`) or MarkDiffusion's DiffusionPurification (`remove_pixel: diffusion`); both are heavy, drift the image, and need the backend present (`/capabilities`). Audio/video watermarks remain out of scope.
-- The reverse-SynthID scorer is external, best-effort, and under a non-commercial Research License; not an official Google detector.
+- The reverse-SynthID scorer is external, best-effort, and under a non-commercial Research License; not an official Google detector. Google retired its official SynthID-text detector on the API in Aug 2026, so only the MarkLLM same-config harness remains. Claude's detection API has been announced but is not public yet — the `claude-text` detector reports unavailable until it ships.
 - **C2PA soft binding** (content watermark that re-links to a remote manifest after metadata strip) is out of scope — stripping hard-bound C2PA does not clear it.
 - Data-driven / backdoor model marks (trigger phrases) are out of scope.
 

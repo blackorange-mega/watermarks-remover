@@ -17,6 +17,54 @@ from audit_lib import format_sarif
 from tests.test_clean_image import _minimal_png_with_text
 
 
+def test_audit_dir_partial_scan_exit_3(monkeypatch, tmp_path, capsys):
+    """Every output format reports a partial scan (skipped files) with the
+    same distinct exit code, 3."""
+    import audit_dir
+
+    (tmp_path / "clean.txt").write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(
+        audit_dir,
+        "_scan_worker",
+        lambda _path, _check: (None, {"path": "x", "reason": "boom"}),
+    )
+    for extra in ((), ("--json",), ("--format", "sarif")):
+        monkeypatch.setattr(sys, "argv", ["audit_dir.py", str(tmp_path), *extra])
+        assert audit_dir.main() == 3, extra
+
+
+def test_audit_dir_partial_outranks_actionable(monkeypatch, tmp_path):
+    """Partial wins over actionable findings: an incomplete audit is the
+    more important CI signal."""
+    import audit_dir
+
+    calls = {"n": 0}
+
+    def _worker(path, _check):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                {
+                    "path": str(path),
+                    "kind": "text",
+                    "has_c2pa": False,
+                    "has_ai_metadata": True,
+                    "suspicious_total": 1,
+                    "findings": ["meta: ai"],
+                    "confidence": ["probable"],
+                    "notes": [],
+                },
+                None,
+            )
+        return (None, {"path": str(path), "reason": "boom"})
+
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    monkeypatch.setattr(audit_dir, "_scan_worker", _worker)
+    monkeypatch.setattr(sys, "argv", ["audit_dir.py", str(tmp_path), "--json"])
+    assert audit_dir.main() == 3
+
+
 def test_format_sarif_structure():
     fake_report = {
         "root": "/workspace/project",

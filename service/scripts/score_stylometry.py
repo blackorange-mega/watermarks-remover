@@ -122,7 +122,7 @@ class StylometryReport:
     path: str
     word_count: int
     sentence_count: int
-    burstiness_cv: float
+    burstiness_cv: float | None
     lexical_diversity: float
     ai_ngram_density: float
     matched_markers: list[dict[str, Any]]
@@ -137,7 +137,9 @@ class StylometryReport:
             "path": self.path,
             "word_count": self.word_count,
             "sentence_count": self.sentence_count,
-            "burstiness_cv": round(self.burstiness_cv, 4),
+            "burstiness_cv": round(self.burstiness_cv, 4)
+            if self.burstiness_cv is not None
+            else None,
             "lexical_diversity": round(self.lexical_diversity, 4),
             "ai_ngram_density": round(self.ai_ngram_density, 4),
             "matched_markers": self.matched_markers,
@@ -177,16 +179,22 @@ def extract_words(text: str) -> list[str]:
     return [w.lower() for w in RE_WORDS.findall(text)]
 
 
-def compute_burstiness(sentences: list[str]) -> tuple[float, float, float]:
-    """Compute mean sentence word length, standard deviation, and coefficient of variation (CV)."""
+def compute_burstiness(sentences: list[str]) -> tuple[float, float, float | None]:
+    """Compute mean sentence word length, standard deviation, and coefficient of variation (CV).
+
+    CV is ``None`` when it cannot be measured (no sentences, or fewer than two
+    with words): a one-or-zero-sample CV is undefined, and reporting it as 0.0
+    made the caller's tiering read "perfectly uniform" — the strongest
+    LLM-likeness signal — for text whose body yielded no sentences at all (#132).
+    """
     if not sentences:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, None
 
     lengths = [len(extract_words(s)) for s in sentences]
     lengths = [L for L in lengths if L > 0]
     if len(lengths) < 2:
         mean_len = float(lengths[0]) if lengths else 0.0
-        return mean_len, 0.0, 0.0
+        return mean_len, 0.0, None
 
     mean_len = sum(lengths) / len(lengths)
     variance = sum((x - mean_len) ** 2 for x in lengths) / (len(lengths) - 1)
@@ -264,7 +272,7 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
             path=path,
             word_count=word_count,
             sentence_count=sentence_count,
-            burstiness_cv=0.0,
+            burstiness_cv=None,
             lexical_diversity=compute_mattr(words),
             ai_ngram_density=0.0,
             matched_markers=[m.to_dict() for m in marker_matches],
@@ -286,7 +294,13 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
 
     # 3. Component Sub-scores (0.0 to 1.0)
     # Burstiness subscore: low CV (<0.35) is strongly characteristic of LLMs; high CV (>0.60) is human
-    if cv < 0.25:
+    burstiness_score: float | None
+    if cv is None:
+        # Fewer than two parseable sentences: burstiness is unmeasurable, not
+        # maximally LLM-like. The composite renormalizes over the remaining
+        # components instead of crediting the strongest signal (#132).
+        burstiness_score = None
+    elif cv < 0.25:
         burstiness_score = 0.95
     elif cv < 0.35:
         burstiness_score = 0.80
@@ -313,7 +327,13 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
     diversity_score = 0.4 if 0.68 <= mattr <= 0.76 else 0.1
 
     # 4. Composite Scoring & Small-Sample Dampening
-    raw_composite = (burstiness_score * 0.45) + (ngram_score * 0.45) + (diversity_score * 0.10)
+    if burstiness_score is None:
+        notes.append(
+            "Sentence burstiness unavailable (fewer than 2 parsed sentences — e.g. body wrapped in a code fence); composite renormalized over AI-phrase density and lexical diversity"
+        )
+        raw_composite = ((ngram_score * 0.45) + (diversity_score * 0.10)) / 0.55
+    else:
+        raw_composite = (burstiness_score * 0.45) + (ngram_score * 0.45) + (diversity_score * 0.10)
 
     # Dampening factor: scales smoothly from 0.4 at MIN_SAMPLE_WORDS up to 1.0 at FULL_WEIGHT_WORDS
     if word_count < FULL_WEIGHT_WORDS:
@@ -333,7 +353,7 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
         for m in marker_matches:
             findings.append(f"AI cadence phrase '{m.phrase}' ({m.count}x)")
 
-    if cv < 0.35 and sentence_count >= 3:
+    if cv is not None and cv < 0.35 and sentence_count >= 3:
         findings.append(f"Unnaturally uniform sentence cadence (CV={cv:.2f} < 0.35)")
 
     if ngram_density >= 1.0:
@@ -372,7 +392,12 @@ def print_human_stylometry_report(report: StylometryReport, explain: bool = Fals
     print(f"AI Probability:     {report.score * 100:.1f}% (score: {report.score:.3f})")
     print(f"Word Count:         {report.word_count}")
     print(f"Sentence Count:     {report.sentence_count}")
-    print(f"Sentence CV:        {report.burstiness_cv:.3f}")
+    cv_display = (
+        f"{report.burstiness_cv:.3f}"
+        if report.burstiness_cv is not None
+        else "n/a (fewer than 2 sentences)"
+    )
+    print(f"Sentence CV:        {cv_display}")
     print(f"Lexical Diversity:  {report.lexical_diversity:.3f} (MATTR)")
     print(f"AI Marker Density:  {report.ai_ngram_density:.3f} / 100 words")
 

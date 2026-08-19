@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -45,7 +46,7 @@ def test_run_synthid_score_unconfigured_returns_none(
     assert run_synthid_score(Path("x.png")) is None
 
 
-def test_run_synthid_score_unavailable_returns_none(
+def test_run_synthid_score_unavailable_returns_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -53,7 +54,48 @@ def test_run_synthid_score_unavailable_returns_none(
         return SimpleNamespace(returncode=3, stdout="", stderr="unavailable")
 
     monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
-    assert run_synthid_score(Path("x.png"), upstream_dir=str(tmp_path / "upstream")) is None
+    result = run_synthid_score(Path("x.png"), upstream_dir=str(tmp_path / "upstream"))
+
+    assert result is not None
+    assert result.get("available") is False
+    assert "unavailable" in result.get("error", "")
+
+
+def test_run_synthid_score_prefers_checkout_venv_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    upstream = tmp_path / "upstream"
+    venv_python = upstream / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n")
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
+    run_synthid_score(Path("img.png"), upstream_dir=str(upstream))
+
+    assert captured["cmd"][0] == str(venv_python)
+
+
+def test_run_synthid_score_falls_back_to_sys_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    upstream = tmp_path / "upstream"  # no .venv present
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(image_meta.subprocess, "run", fake_run)
+    run_synthid_score(Path("img.png"), upstream_dir=str(upstream))
+
+    assert captured["cmd"][0] == sys.executable
 
 
 def test_run_synthid_score_parses_json(

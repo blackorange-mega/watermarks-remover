@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -345,138 +344,17 @@ def test_cli_watermark_runtime_error(tmp_path: Path):
     assert "boom" in (r.stderr or "")
 
 
-def test_rewrite_markllm_detect_missing_venv(tmp_path: Path):
-    import rewrite_text
-
-    upstream = tmp_path / "MarkLLM"
-    upstream.mkdir()
-    result = rewrite_text._markllm_detect(
-        "hello",
-        scheme="kgw",
-        upstream_dir=str(upstream),
-        model="x",
-        timeout=5,
-    )
-    assert result["available"] is False
-
-
-def test_rewrite_markllm_detect_parses_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import rewrite_text
-
-    upstream = tmp_path / "MarkLLM"
-    if os.name == "nt":
-        venv_python = upstream / ".venv" / "Scripts" / "python.exe"
-    else:
-        venv_python = upstream / ".venv" / "bin" / "python"
-    venv_python.parent.mkdir(parents=True)
-    venv_python.write_text("")
-    (upstream / "watermark").mkdir()
-
-    payload = {"available": True, "is_watermarked": True, "score": 2.0}
-    captured: dict = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["input"] = kwargs.get("input")
-        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
-
-    monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
-    result = rewrite_text._markllm_detect(
-        "hello",
-        scheme="kgw",
-        upstream_dir=str(upstream),
-        model="x",
-        timeout=5,
-    )
-    assert result["available"] is True
-    assert result["score"] == 2.0
-    assert captured["input"] == "hello"
-    assert captured["cmd"][0] == str(venv_python)
-
-
-def test_rewrite_markllm_detect_adapter_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import rewrite_text
-
-    upstream = tmp_path / "MarkLLM"
-    if os.name == "nt":
-        venv_python = upstream / ".venv" / "Scripts" / "python.exe"
-    else:
-        venv_python = upstream / ".venv" / "bin" / "python"
-    venv_python.parent.mkdir(parents=True)
-    venv_python.write_text("")
-    (upstream / "watermark").mkdir()
-
-    def fake_run(cmd, **kwargs):
-        return SimpleNamespace(returncode=3, stdout="", stderr="deps missing")
-
-    monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
-    result = rewrite_text._markllm_detect(
-        "hello",
-        scheme="kgw",
-        upstream_dir=str(upstream),
-        model="x",
-        timeout=5,
-    )
-    assert result["available"] is False
-    assert "deps missing" in result["error"]
-
-
-def test_markllm_preexec_default_off(monkeypatch: pytest.MonkeyPatch):
-    import rewrite_text
-
-    monkeypatch.delenv("WATERMARKS_MARKLLM_RLIMIT_AS", raising=False)
-    assert rewrite_text._markllm_preexec() is None
-
-
-def test_markllm_preexec_env(monkeypatch: pytest.MonkeyPatch):
-    import rewrite_text
-
-    if os.name != "posix":
-        pytest.skip("preexec_fn is POSIX-only")
-    monkeypatch.setenv("WATERMARKS_MARKLLM_RLIMIT_AS", "0x40000000")
-    fn = rewrite_text._markllm_preexec()
-    assert callable(fn)
-
-
-def test_rewrite_markllm_detect_applies_rlimit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    import rewrite_text
-
-    if os.name != "posix":
-        pytest.skip("preexec_fn is POSIX-only")
-    upstream = tmp_path / "MarkLLM"
-    venv_python = upstream / ".venv" / "bin" / "python"
-    venv_python.parent.mkdir(parents=True)
-    venv_python.write_text("")
-    (upstream / "watermark").mkdir()
-    monkeypatch.setenv("WATERMARKS_MARKLLM_RLIMIT_AS", "1073741824")
-    captured: dict = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["preexec_fn"] = kwargs.get("preexec_fn")
-        return SimpleNamespace(returncode=0, stdout='{"available": true}', stderr="")
-
-    monkeypatch.setattr(rewrite_text.subprocess, "run", fake_run)
-    result = rewrite_text._markllm_detect(
-        "hello",
-        scheme="kgw",
-        upstream_dir=str(upstream),
-        model="x",
-        timeout=5,
-    )
-    assert result["available"] is True
-    assert callable(captured["preexec_fn"])
-
-
 def test_rewrite_markllm_hook_records_before_after(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import rewrite_text
 
-    def fake_detect(text, **kwargs):
-        return {"available": True, "is_watermarked": text == "ORIG", "score": 3.0}
+    class _FakeDetector:
+        def __init__(self, **kwargs):
+            pass
 
-    monkeypatch.setattr(rewrite_text, "_markllm_detect", fake_detect)
+        def detect(self, text):
+            return {"available": True, "is_watermarked": text == "ORIG", "score": 3.0}
+
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _FakeDetector)
     monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "REWRITTEN OUTPUT")
     out, info = rewrite_text.rewrite(
         "ORIG",

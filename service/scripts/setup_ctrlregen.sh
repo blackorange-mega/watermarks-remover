@@ -78,6 +78,21 @@ if [[ ! -d "$DIR/.git" ]]; then
   fi
 else
   echo "Using existing checkout: $DIR"
+  HEAD_SHA="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$HEAD_SHA" != "$REF" ]]; then
+    echo "existing checkout not at pinned ref $REF (HEAD: ${HEAD_SHA:-missing}); re-pinning"
+    git -C "$DIR" fetch --depth 1 origin "$REF" || {
+      echo "error: could not fetch pinned ref $REF" >&2
+      exit 1
+    }
+    git -C "$DIR" checkout --detach "$REF"
+    git -C "$DIR" sparse-checkout set --no-cone '/src/'
+    HEAD_SHA="$(git -C "$DIR" rev-parse HEAD)"
+    if [[ "$HEAD_SHA" != "$REF" ]]; then
+      echo "error: expected pinned ref $REF, got $HEAD_SHA" >&2
+      exit 1
+    fi
+  fi
 fi
 
 if [[ ! -x "$DIR/.venv/bin/python" ]]; then

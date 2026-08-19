@@ -11,6 +11,7 @@ import re
 import subprocess
 import urllib.parse
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,32 @@ from image_meta import (
 )
 from image_meta import (
     detect_format as detect_image_format,
+)
+
+
+class ZipBudgetExceeded(Exception):
+    """A zip's declared decompressed size exceeds the processing cap.
+
+    Kept separate from the parse errors below so a refused zip bomb keeps
+    propagating (as it already does out of the clean_* helpers) instead of
+    being reported as an unparseable container.
+    """
+
+
+# A corrupt, truncated, encrypted, or unsupported-compression zip surfaces as
+# more than just BadZipFile: reading a member can raise NotImplementedError
+# (unknown compression/version), RuntimeError (encrypted), zlib.error (bad
+# deflate stream), EOFError (truncated), OSError (invalid stream), or
+# ValueError (e.g. a negative seek).
+_ZIP_PARSE_ERRORS = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    NotImplementedError,
+    RuntimeError,
+    EOFError,
+    OSError,
+    ValueError,
+    zlib.error,
 )
 
 # Frontmatter / meta keys that often carry AI provenance
@@ -162,7 +189,7 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
                         return "odt"
                     if "META-INF/container.xml" in names and any(n.endswith(".opf") for n in names):
                         return "epub"
-            except zipfile.BadZipFile:
+            except _ZIP_PARSE_ERRORS:
                 pass
     return "unknown"
 
@@ -302,6 +329,80 @@ def _clean_embedded_data_uris(
 
     out = RE_DATA_IMAGE_URI.sub(_replace_uri, text)
     return out, actions
+
+
+# ---------------------------------------------------------------------------
+# Linear tag-block scanning
+# ---------------------------------------------------------------------------
+#
+# The lazy ".*?</close>" idiom is quadratic on adversarial input: with many
+# opening tags and no closing tag, the engine rescans to end-of-input from
+# every candidate start position (CPython's "re" holds the GIL, so one such
+# request stalls the whole single-process service for its duration). The
+# helpers below locate every opening and closing tag once and pair them with a
+# forward pointer - O(n) total regardless of input shape - while preserving
+# the exact match semantics of re.subn with a lazy ".*?" (the first closing
+# tag at/after each opening tag's end, blocks never overlapping).
+
+
+def _iter_tag_blocks(text, open_re, close_re):
+    """Yield (open_start, open_end, close_start, close_end) for each block.
+
+    Works on str and bytes alike. Linear in len(text): closing tags are
+    collected once with finditer and consumed by a forward pointer, so an
+    unbounded run of unclosed opening tags costs one pass, not one rescan per
+    opening tag.
+    """
+    closes = list(close_re.finditer(text))
+    ci = 0
+    last_end = 0
+    for om in open_re.finditer(text):
+        if om.start() < last_end:
+            continue
+        while ci < len(closes) and closes[ci].start() < om.end():
+            ci += 1
+        if ci >= len(closes):
+            return
+        cm = closes[ci]
+        yield om.start(), om.end(), cm.start(), cm.end()
+        last_end = cm.end()
+
+
+def _drop_tag_blocks(text, open_re, close_re):
+    """Remove every open...close block. Return (text, count). Linear time."""
+    out = []
+    last = 0
+    count = 0
+    for os_, _oe, _cs, ce in _iter_tag_blocks(text, open_re, close_re):
+        out.append(text[last:os_])
+        last = ce
+        count += 1
+    if not count:
+        return text, 0
+    out.append(text[last:])
+    return text[:0].join(out), count
+
+
+def _drop_blocks_if(text, open_re, close_re, predicate):
+    """Drop blocks whose full text satisfies predicate. Return (text, count).
+
+    Blocks failing the predicate are kept verbatim; predicate is called with
+    the whole block (open tag through closing tag), matching the
+    callback-based re.sub sites this replaces.
+    """
+    out = []
+    last = 0
+    count = 0
+    for os_, _oe, _cs, ce in _iter_tag_blocks(text, open_re, close_re):
+        if not predicate(text[os_:ce]):
+            continue
+        out.append(text[last:os_])
+        last = ce
+        count += 1
+    if not count:
+        return text, 0
+    out.append(text[last:])
+    return text[:0].join(out), count
 
 
 # ---------------------------------------------------------------------------
@@ -452,10 +553,11 @@ def _is_cms_generator_meta(tag: str) -> bool:
     return not (_GENERATOR_AI_RE.search(attrs.get("content", "")) or _GENERATOR_AI_RE.search(tag))
 
 
-_JSONLD_RE = re.compile(
-    r"<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>.*?</script>",
-    re.I | re.DOTALL,
+_JSONLD_OPEN_RE = re.compile(
+    r"""<script\b[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>""",
+    re.I,
 )
+_JSONLD_CLOSE_RE = re.compile(r"</script>", re.I)
 
 
 def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
@@ -473,8 +575,8 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
         ):
             has_ai = True
             findings.append(f"meta: {tag[:120]}")
-    for m in _JSONLD_RE.finditer(text):
-        blob = m.group(0)
+    for os_, _oe, _cs, ce in _iter_tag_blocks(text, _JSONLD_OPEN_RE, _JSONLD_CLOSE_RE):
+        blob = text[os_:ce]
         if AI_META_NAME_RE.search(blob) or re.search(
             r"DigitalSourceType|trainedAlgorithmicMedia|SoftwareAgent", blob, re.I
         ):
@@ -513,16 +615,15 @@ def clean_html(text: str) -> tuple[str, list[str]]:
 
     out = _META_TAG_RE.sub(_meta_sub, text)
 
-    def _jsonld_sub(m: re.Match[str]) -> str:
-        blob = m.group(0)
-        if AI_META_NAME_RE.search(blob) or re.search(
+    def _jsonld_is_ai(blob: str) -> bool:
+        return AI_META_NAME_RE.search(blob) or re.search(
             r"DigitalSourceType|trainedAlgorithmicMedia|SoftwareAgent", blob, re.I
-        ):
-            actions.append("drop json-ld provenance-like script")
-            return ""
-        return blob
+        )
 
-    out = _JSONLD_RE.sub(_jsonld_sub, out)
+    new, n = _drop_blocks_if(out, _JSONLD_OPEN_RE, _JSONLD_CLOSE_RE, _jsonld_is_ai)
+    if n:
+        actions.extend(["drop json-ld provenance-like script"] * n)
+        out = new
     out2, n = re.subn(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", "", out, flags=re.I)
     if n:
         actions.append(f"drop data-ai* attributes x{n}")
@@ -540,6 +641,19 @@ def clean_html(text: str) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 # SVG
 # ---------------------------------------------------------------------------
+
+# Opening/closing tag patterns for the linear block scans below. Kept as
+# separate open/close halves: the lazy ".*?</close>" form is quadratic when
+# many opening tags have no closing tag (see _iter_tag_blocks).
+_SVG_METADATA_OPEN_RE = re.compile(r"<metadata\b[^>]*>", re.I)
+_SVG_METADATA_CLOSE_RE = re.compile(r"</metadata\s*>", re.I)
+_SVG_XMPMETA_OPEN_RE = re.compile(r"<x:xmpmeta\b[^>]*>", re.I)
+_SVG_XMPMETA_CLOSE_RE = re.compile(r"</x:xmpmeta\s*>", re.I)
+_SVG_COMMENT_OPEN_RE = re.compile(r"<!--")
+# HTML comment end tags are "-->" or "--!>" (CodeQL: bad HTML filtering
+# regexp otherwise). XML/SVG only emits "-->", but accepting both keeps the
+# scrub effective on HTML-flavoured inputs.
+_SVG_COMMENT_CLOSE_RE = re.compile(r"--!?>")
 
 
 def inspect_svg(data: bytes) -> tuple[bool, bool, list[str], dict]:
@@ -571,36 +685,25 @@ def inspect_svg(data: bytes) -> tuple[bool, bool, list[str], dict]:
 def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
     actions: list[str] = []
     text = data.decode("utf-8", errors="surrogateescape")
-    # Drop metadata blocks
-    new, n = re.subn(
-        r"<metadata\b[^>]*>.*?</metadata\s*>",
-        "",
-        text,
-        flags=re.I | re.DOTALL,
-    )
+    # Drop metadata blocks (linear scan - lazy .*? is quadratic on unclosed tags)
+    new, n = _drop_tag_blocks(text, _SVG_METADATA_OPEN_RE, _SVG_METADATA_CLOSE_RE)
     if n:
         actions.append(f"drop <metadata> x{n}")
         text = new
     # Drop adobe xmp packets
-    new, n = re.subn(
-        r"<x:xmpmeta\b[^>]*>.*?</x:xmpmeta\s*>",
-        "",
-        text,
-        flags=re.I | re.DOTALL,
-    )
+    new, n = _drop_tag_blocks(text, _SVG_XMPMETA_OPEN_RE, _SVG_XMPMETA_CLOSE_RE)
     if n:
         actions.append(f"drop xmpmeta x{n}")
         text = new
 
-    # Drop comments that look like provenance
-    def _cmt(m: re.Match[str]) -> str:
-        body = m.group(0)
-        if AI_META_NAME_RE.search(body):
-            actions.append("drop SVG comment with AI markers")
-            return ""
-        return body
+    # Drop comments that look like provenance (linear scan)
+    def _cmt(block: str) -> bool:
+        return bool(AI_META_NAME_RE.search(block))
 
-    text = re.sub(r"<!--.*?-->", _cmt, text, flags=re.DOTALL)
+    new, n = _drop_blocks_if(text, _SVG_COMMENT_OPEN_RE, _SVG_COMMENT_CLOSE_RE, _cmt)
+    if n:
+        actions.extend(["drop SVG comment with AI markers"] * n)
+        text = new
 
     # Clean embedded data URIs
     text, uri_actions = _clean_embedded_data_uris(text)
@@ -626,6 +729,12 @@ def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
 # ---------------------------------------------------------------------------
 # DOCX / ODT (zip + XML)
 # ---------------------------------------------------------------------------
+
+# Open/close tag halves for the linear metadata-block scans in clean_odt.
+_ODT_GENERATOR_OPEN_RE = re.compile(r"<meta:generator\b[^>]*>", re.I)
+_ODT_GENERATOR_CLOSE_RE = re.compile(r"</meta:generator\s*>", re.I)
+_DC_CREATOR_OPEN_RE = re.compile(r"<dc:creator\b[^>]*>", re.I)
+_DC_CREATOR_CLOSE_RE = re.compile(r"</dc:creator\s*>", re.I)
 
 DOCX_META_PARTS = (
     "docProps/core.xml",
@@ -663,13 +772,46 @@ MAX_ZIP_DECOMPRESSED_BYTES = 128 * 1024 * 1024
 
 
 def _check_zip_budget(info: zipfile.ZipInfo, budget: list[int]) -> None:
-    """Reject zip bombs before decompression (ZipInfo.file_size is stored)."""
-    budget[0] += info.file_size
-    if budget[0] > MAX_ZIP_DECOMPRESSED_BYTES:
-        raise ValueError(
+    """Fast-path zip-bomb guard on the declared member size.
+
+    A single member whose *declared* size already exceeds the cap is
+    rejected before any decompression. The authoritative accounting lives in
+    _read_zip_member, which charges **actual** decompressed bytes to the
+    shared budget: ZipInfo.file_size comes from the archive central
+    directory and is attacker-controlled, so trusting it for the cumulative
+    limit would let a crafted archive declare a tiny size and still expand
+    to gigabytes.
+    """
+    if info.file_size > MAX_ZIP_DECOMPRESSED_BYTES:
+        raise ZipBudgetExceeded(
             "zip decompressed size exceeds cap "
             f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
         )
+
+
+def _read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: list[int]) -> bytes:
+    """Read one zip member, charging real decompressed bytes to the budget.
+
+    Streams the member in chunks so the cumulative cap is enforced on bytes
+    actually produced, not on the declared ``file_size``; raises
+    ``ZipBudgetExceeded`` the moment the cap is crossed, before the whole
+    member is buffered.
+    """
+    _check_zip_budget(info, budget)
+    with zf.open(info) as stream:
+        chunks: list[bytes] = []
+        while True:
+            chunk = stream.read(1 << 16)
+            if not chunk:
+                break
+            budget[0] += len(chunk)
+            if budget[0] > MAX_ZIP_DECOMPRESSED_BYTES:
+                raise ZipBudgetExceeded(
+                    "zip decompressed size exceeds cap "
+                    f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _is_docx_meta_part(name: str) -> bool:
@@ -695,7 +837,7 @@ def _inspect_ooxml_zip(data: bytes, fmt: str) -> tuple[bool, bool, list[str], di
                     name,
                     re.I,
                 ):
-                    raw = zf.read(name)
+                    raw = _read_zip_member(zf, info, budget)
                     img_fmt = detect_image_format(raw)
                     sub_c2pa, sub_ai, sub_findings = False, False, []
                     if img_fmt == "png":
@@ -727,7 +869,7 @@ def _inspect_ooxml_zip(data: bytes, fmt: str) -> tuple[bool, bool, list[str], di
                 # vendor names such as "Claude" without being AI-generated metadata.
                 if not _is_docx_meta_part(name):
                     continue
-                raw = zf.read(name)
+                raw = _read_zip_member(zf, info, budget)
                 c2, ai, hits = _blob_hits(raw)
                 if c2 or ai:
                     if c2:
@@ -739,7 +881,7 @@ def _inspect_ooxml_zip(data: bytes, fmt: str) -> tuple[bool, bool, list[str], di
             custom = [n for n in parts if n.startswith("customXml/")]
             if custom:
                 findings.append(f"customXml parts: {len(custom)}")
-    except zipfile.BadZipFile:
+    except _ZIP_PARSE_ERRORS:
         return False, False, [f"not a valid {fmt.upper()} zip"], {}
     return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(parts)}
 
@@ -756,6 +898,82 @@ def inspect_pptx(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return _inspect_ooxml_zip(data, "pptx")
 
 
+_XML_CHAR_REF_RE = re.compile(r"&#(?:x([0-9A-Fa-f]+)|([0-9]+));|&(amp|lt|gt|quot|apos);")
+_XML_NAMED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+
+
+def _decode_xml_entities(s: str) -> str:
+    """Decode what a conforming XML parser would resolve: numeric character
+    references and the five predefined entities. A watermark carrier encoded as
+    ``&#x200B;`` otherwise reaches Layer A as nine ASCII characters and survives
+    cleaning, because the parser in Word/Writer decodes the entity afterwards
+    (#129). Anything a parser would leave literal stays literal here.
+    """
+
+    def _sub(m: re.Match[str]) -> str:
+        hex_digits, decimal, named = m.group(1), m.group(2), m.group(3)
+        if named:
+            return _XML_NAMED_ENTITIES[named]
+        codepoint = int(hex_digits, 16) if hex_digits else int(decimal)
+        if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            return m.group(0)  # not a character; leave for the real parser to reject
+        try:
+            return chr(codepoint)
+        except ValueError:
+            return m.group(0)
+
+    return _XML_CHAR_REF_RE.sub(_sub, s)
+
+
+def _reencode_xml_text(s: str) -> str:
+    """Escape text content the way a serializer would: ``&``, ``<`` and ``>``.
+
+    ``>`` is legal literally in text content but re-escaping it is a semantic
+    no-op, and ``<``/``&`` must be escaped anyway — so a decode/clean/re-encode
+    round trip is stable for any well-formed input.
+    """
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _scrub_text_runs(
+    xml_text: str, open_re: re.Pattern[str], close_re: re.Pattern[str]
+) -> tuple[str, int, int]:
+    """Run Layer A over the text runs delimited by open_re/close_re.
+
+    XML character references are decoded first (a carrier written as
+    ``&#x200B;`` otherwise reaches Layer A as nine ASCII characters and
+    survives cleaning, only to be resurrected by the parser in Word/Writer —
+    #129) and the surviving text is re-encoded on the way out, so the round
+    trip is stable for any well-formed input.
+
+    Shared by the DOCX/XLSX/PPTX body scrubs. Linear scan (see
+    _iter_tag_blocks) - the previous "(<tag>)(.*?)(</tag>)" lazy pattern was
+    quadratic on a run of unclosed opening tags.
+    """
+    from text_unicode import clean_text  # local import to avoid cycles
+
+    removed = 0
+    replaced = 0
+    out = []
+    last = 0
+    for os_, oe, cs_, ce in _iter_tag_blocks(xml_text, open_re, close_re):
+        open_tag = xml_text[os_:oe]
+        inner = xml_text[oe:cs_]
+        close_tag = xml_text[cs_:ce]
+        new_inner, stats = clean_text(_decode_xml_entities(inner))
+        if not (stats["removed_count"] or stats["replaced_count"]):
+            continue
+        removed += stats["removed_count"]
+        replaced += stats["replaced_count"]
+        if (new_inner[:1].isspace() or new_inner[-1:].isspace()) and "xml:space" not in open_tag:
+            open_tag = open_tag[:-1] + ' xml:space="preserve">'
+        out.append(xml_text[last:os_])
+        out.append(open_tag + _reencode_xml_text(new_inner) + close_tag)
+        last = ce
+    out.append(xml_text[last:])
+    return "".join(out), removed, replaced
+
+
 def _scrub_docx_text(xml_text: str) -> tuple[str, int, int]:
     """Run Layer A over the ``<w:t>`` text runs of a DOCX part.
 
@@ -764,69 +982,17 @@ def _scrub_docx_text(xml_text: str) -> tuple[str, int, int]:
     trailing whitespace survives the clean, the node keeps
     ``xml:space="preserve"`` so Word does not trim it.
     """
-    from text_unicode import clean_text  # local import to avoid cycles
-
-    removed = 0
-    replaced = 0
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal removed, replaced
-        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
-        new_inner, stats = clean_text(inner)
-        if not (stats["removed_count"] or stats["replaced_count"]):
-            return m.group(0)
-        removed += stats["removed_count"]
-        replaced += stats["replaced_count"]
-        if (new_inner[:1].isspace() or new_inner[-1:].isspace()) and "xml:space" not in open_tag:
-            open_tag = open_tag[:-1] + ' xml:space="preserve">'
-        return open_tag + new_inner + close_tag
-
-    new = re.sub(r"(<w:t\b[^>]*>)(.*?)(</w:t>)", _repl, xml_text, flags=re.S)
-    return new, removed, replaced
+    return _scrub_text_runs(xml_text, re.compile(r"<w:t\b[^>]*>"), re.compile(r"</w:t>"))
 
 
 def _scrub_xlsx_text(xml_text: str) -> tuple[str, int, int]:
     """Run Layer A over the ``<t>`` text elements of an XLSX part."""
-    from text_unicode import clean_text  # local import to avoid cycles
-
-    removed = 0
-    replaced = 0
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal removed, replaced
-        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
-        new_inner, stats = clean_text(inner)
-        if not (stats["removed_count"] or stats["replaced_count"]):
-            return m.group(0)
-        removed += stats["removed_count"]
-        replaced += stats["replaced_count"]
-        if (new_inner[:1].isspace() or new_inner[-1:].isspace()) and "xml:space" not in open_tag:
-            open_tag = open_tag[:-1] + ' xml:space="preserve">'
-        return open_tag + new_inner + close_tag
-
-    new = re.sub(r"(<t\b[^>]*>)(.*?)(</t>)", _repl, xml_text, flags=re.S)
-    return new, removed, replaced
+    return _scrub_text_runs(xml_text, re.compile(r"<t\b[^>]*>"), re.compile(r"</t>"))
 
 
 def _scrub_pptx_text(xml_text: str) -> tuple[str, int, int]:
     """Run Layer A over the ``<a:t>`` text elements of a PPTX part."""
-    from text_unicode import clean_text  # local import to avoid cycles
-
-    removed = 0
-    replaced = 0
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal removed, replaced
-        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
-        new_inner, stats = clean_text(inner)
-        if not (stats["removed_count"] or stats["replaced_count"]):
-            return m.group(0)
-        removed += stats["removed_count"]
-        replaced += stats["replaced_count"]
-        return open_tag + new_inner + close_tag
-
-    new = re.sub(r"(<a:t\b[^>]*>)(.*?)(</a:t>)", _repl, xml_text, flags=re.S)
-    return new, removed, replaced
+    return _scrub_text_runs(xml_text, re.compile(r"<a:t\b[^>]*>"), re.compile(r"</a:t>"))
 
 
 def _scrub_odt_text(xml_text: str) -> tuple[str, int, int]:
@@ -834,25 +1000,47 @@ def _scrub_odt_text(xml_text: str) -> tuple[str, int, int]:
 
     ``text:span``/``text:tab``/``text:s`` children live inside the paragraph,
     so cleaning the paragraph content covers the visible text. The markup
-    itself is untouched.
+    itself is untouched: entities are decoded and re-encoded per text segment
+    only — a whole-paragraph round trip would escape the nested markup.
+    Linear scan (see _iter_tag_blocks).
     """
     from text_unicode import clean_text  # local import to avoid cycles
 
     removed = 0
     replaced = 0
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal removed, replaced
-        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
-        new_inner, stats = clean_text(inner)
-        if not (stats["removed_count"] or stats["replaced_count"]):
-            return m.group(0)
-        removed += stats["removed_count"]
-        replaced += stats["replaced_count"]
-        return open_tag + new_inner + close_tag
-
-    new = re.sub(r"(<text:p\b[^>]*>)(.*?)(</text:p>)", _repl, xml_text, flags=re.S)
-    return new, removed, replaced
+    out = []
+    last = 0
+    for os_, oe, cs_, ce in _iter_tag_blocks(
+        xml_text, re.compile(r"<text:p\b[^>]*>"), re.compile(r"</text:p>")
+    ):
+        open_tag = xml_text[os_:oe]
+        inner = xml_text[oe:cs_]
+        close_tag = xml_text[cs_:ce]
+        parts = re.split(r"(<[^>]+>)", inner)
+        new_parts: list[str] = []
+        changed = False
+        for segment in parts:
+            if not segment or segment.startswith("<"):
+                new_parts.append(segment)
+                continue
+            new_segment, stats = clean_text(_decode_xml_entities(segment))
+            if stats["removed_count"] or stats["replaced_count"]:
+                removed += stats["removed_count"]
+                replaced += stats["replaced_count"]
+                changed = True
+                new_parts.append(_reencode_xml_text(new_segment))
+            else:
+                new_parts.append(segment)
+        if not changed:
+            continue
+        new_para = "".join(new_parts)
+        if (new_para[:1].isspace() or new_para[-1:].isspace()) and "xml:space" not in open_tag:
+            open_tag = open_tag[:-1] + ' xml:space="preserve">'
+        out.append(xml_text[last:os_])
+        out.append(open_tag + new_para + close_tag)
+        last = ce
+    out.append(xml_text[last:])
+    return "".join(out), removed, replaced
 
 
 def _prune_dangling_relationships(
@@ -872,8 +1060,12 @@ def _prune_dangling_relationships(
     dropped = [0]
 
     def _target_attr(tag: str) -> str:
-        m = re.search(r'\bTarget\s*=\s*"([^"]*)"', tag, re.I)
-        return m.group(1) if m else ""
+        # XML allows single- or double-quoted attribute values; matching only
+        # double quotes made every single-quoted Relationship look like an
+        # empty target, which resolved to the package base and got pruned —
+        # corrupting packages from tools that emit single quotes (#130).
+        m = re.search(r"\bTarget\s*=\s*([\"'])(.*?)\1", tag, re.I)
+        return m.group(2) if m else ""
 
     def _drop(m: re.Match[str]) -> str:
         tag = m.group(0)
@@ -895,6 +1087,84 @@ def _prune_dangling_relationships(
     return new.encode("utf-8"), dropped[0]
 
 
+def _prune_odt_manifest_entries(raw: bytes, dropped: set[str]) -> tuple[bytes, int]:
+    """Remove manifest file-entry elements pointing at dropped parts.
+
+    ODF packages list every member in META-INF/manifest.xml; dropping a part
+    (e.g. one carrying AI/C2PA markers) without removing its entry makes
+    readers flag the package as damaged. full-path is matched
+    attribute-order-independently, mirroring _prune_dangling_relationships.
+    The package-root entry (full-path="/") and entries for surviving parts
+    are left untouched.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    removed = [0]
+
+    def _full_path(tag: str) -> str:
+        # Same single/double-quote tolerance as _target_attr (#130).
+        m = re.search(r"\bfull-path\s*=\s*([\"'])(.*?)\1", tag, re.I)
+        return m.group(2) if m else ""
+
+    def _drop(m: re.Match[str]) -> str:
+        tag = m.group(0)
+        path = posixpath.normpath(_full_path(tag).lstrip("/"))
+        if path in ("", "."):
+            return tag  # package root — never pruned
+        if path in dropped:
+            removed[0] += 1
+            return ""
+        return tag
+
+    new = re.sub(r"<manifest:file-entry\b[^>]*/>", _drop, text, flags=re.I)
+    return new.encode("utf-8"), removed[0]
+
+
+def _prune_opf_manifest(raw: bytes, opf_name: str, dropped: set[str]) -> tuple[bytes, int]:
+    """Remove OPF <item> entries pointing at dropped parts (and spine refs).
+
+    The package document lists every content part; a dropped part that is
+    still referenced makes EPUB readers reject the book. href values are
+    relative to the package document directory, and <itemref> spine entries
+    for removed items are pruned too so no idref dangles.
+    """
+    base = posixpath.dirname(opf_name)
+    text = raw.decode("utf-8", errors="replace")
+    removed = [0]
+    removed_ids: set[str] = set()
+
+    def _attr(tag: str, name: str) -> str:
+        m = re.search(rf'\b{name}\s*=\s*"([^"]*)"', tag, re.I)
+        return m.group(1) if m else ""
+
+    def _drop_item(m: re.Match[str]) -> str:
+        tag = m.group(0)
+        href = _attr(tag, "href")
+        if not href:
+            return tag
+        resolved = posixpath.normpath(posixpath.join(base, href))
+        if resolved in dropped:
+            removed[0] += 1
+            item_id = _attr(tag, "id")
+            if item_id:
+                removed_ids.add(item_id)
+            return ""
+        return tag
+
+    new = re.sub(r"<item\b[^>]*/>", _drop_item, text, flags=re.I)
+
+    if removed_ids:
+
+        def _drop_itemref(m: re.Match[str]) -> str:
+            tag = m.group(0)
+            if _attr(tag, "idref") in removed_ids:
+                removed[0] += 1
+                return ""
+            return tag
+
+        new = re.sub(r"<itemref\b[^>]*/>", _drop_itemref, new, flags=re.I)
+    return new.encode("utf-8"), removed[0]
+
+
 def _scrub_ooxml_zip(
     data: bytes, fmt: str, *, also_layer_a_text: bool = True
 ) -> tuple[bytes, list[str]]:
@@ -905,9 +1175,9 @@ def _scrub_ooxml_zip(
     kept: list[tuple[zipfile.ZipInfo, bytes]] = []
     with zipfile.ZipFile(io.BytesIO(data)) as zin:
         for info in zin.infolist():
-            name = info.filename
             _check_zip_budget(info, budget)
-            raw = zin.read(name)
+            name = info.filename
+            raw = _read_zip_member(zin, info, budget)
 
             # 1. Clean embedded media (PNG, JPEG, WebP, AVIF, HEIC, GIF, BMP, TIFF, SVG)
             if re.search(
@@ -958,14 +1228,21 @@ def _scrub_ooxml_zip(
                 text = raw.decode("utf-8", errors="replace")
                 new = text
                 for tag, label in DOCX_SCRUB_FIELDS:
-                    pat = rf"(<{tag}\b[^>]*>)(.*?)(</{tag}>)"
-
-                    def _empty(m: re.Match[str], _label=label, _name=name) -> str:
-                        if m.group(2):
-                            actions.append(f"scrub {_name} field {_label}")
-                        return m.group(1) + m.group(3)
-
-                    new = re.sub(pat, _empty, new, flags=re.I | re.DOTALL)
+                    open_re = re.compile(rf"<{tag}\b[^>]*>", re.I)
+                    close_re = re.compile(rf"</{tag}>", re.I)
+                    out = []
+                    last = 0
+                    n = 0
+                    for os_, oe, cs_, ce in _iter_tag_blocks(new, open_re, close_re):
+                        out.append(new[last:os_])
+                        out.append(new[os_:oe] + new[cs_:ce])
+                        last = ce
+                        if new[oe:cs_]:
+                            n += 1
+                            actions.append(f"scrub {name} field {label}")
+                    if n:
+                        out.append(new[last:])
+                        new = "".join(out)
                 raw = new.encode("utf-8")
 
             # 4. [Content_Types].xml overrides
@@ -1056,7 +1333,7 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for info in zf.infolist():
                 _check_zip_budget(info, budget)
-                raw = zf.read(info.filename)
+                raw = _read_zip_member(zf, info, budget)
                 c2, ai, hits = _blob_hits(raw)
                 if c2 or ai:
                     if c2:
@@ -1065,54 +1342,48 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
                         has_ai = True
                     findings.append(f"{info.filename}: {', '.join(hits[:6])}")
             if "meta.xml" in zf.namelist():
-                meta = zf.read("meta.xml").decode("utf-8", errors="replace")
+                meta = _read_zip_member(zf, zf.getinfo("meta.xml"), budget).decode(
+                    "utf-8", errors="replace"
+                )
                 if re.search(r"generator|claude|openai|anthropic|gemini", meta, re.I):
                     has_ai = True
                     findings.append("meta.xml generator-like fields")
-    except zipfile.BadZipFile:
+    except _ZIP_PARSE_ERRORS:
         return False, False, ["not a valid ODT zip"], {}
     return has_c2pa, has_ai or has_c2pa, findings, {}
 
 
 def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
     actions: list[str] = []
-    out_buf = io.BytesIO()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
-    with (
-        zipfile.ZipFile(io.BytesIO(data)) as zin,
-        zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout,
-    ):
+    kept: list[tuple[zipfile.ZipInfo, bytes]] = []
+    dropped: set[str] = set()
+    with zipfile.ZipFile(io.BytesIO(data)) as zin:
         for info in zin.infolist():
-            name = info.filename
             _check_zip_budget(info, budget)
-            raw = zin.read(name)
+            name = info.filename
+            raw = _read_zip_member(zin, info, budget)
             if name == "meta.xml":
                 text = raw.decode("utf-8", errors="replace")
-                new, n = re.subn(
-                    r"<meta:generator\b[^>]*>.*?</meta:generator\s*>",
-                    "",
-                    text,
-                    flags=re.I | re.DOTALL,
-                )
+                # Drop meta:generator blocks (linear scan - lazy .*? is
+                # quadratic on unclosed tags, see _iter_tag_blocks)
+                new, n = _drop_tag_blocks(text, _ODT_GENERATOR_OPEN_RE, _ODT_GENERATOR_CLOSE_RE)
                 if n:
                     actions.append("drop meta:generator")
                     text = new
 
-                # scrub creator-like if AI
-                def _creator(m: re.Match[str]) -> str:
-                    if AI_META_NAME_RE.search(m.group(0)):
-                        actions.append("scrub creator-like meta")
-                        return ""
-                    return m.group(0)
+                # scrub creator-like if AI (linear scan)
+                def _is_ai_creator(block: str) -> bool:
+                    return bool(AI_META_NAME_RE.search(block))
 
-                text = re.sub(
-                    r"<dc:creator\b[^>]*>.*?</dc:creator\s*>",
-                    _creator,
-                    text,
-                    flags=re.I | re.DOTALL,
+                new, n = _drop_blocks_if(
+                    text, _DC_CREATOR_OPEN_RE, _DC_CREATOR_CLOSE_RE, _is_ai_creator
                 )
+                if n:
+                    actions.extend(["scrub creator-like meta"] * n)
+                    text = new
                 raw = text.encode("utf-8")
             else:
                 c2, ai, _ = _blob_hits(raw)
@@ -1123,6 +1394,7 @@ def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, li
                     "META-INF/manifest.xml",
                 ):
                     actions.append(f"drop part {name} (AI/C2PA markers)")
+                    dropped.add(name)
                     continue
             # Layer A over the visible paragraph text of the body part.
             if also_layer_a_text and name == "content.xml":
@@ -1132,6 +1404,26 @@ def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, li
                     layer_removed += r
                     layer_replaced += rp
                     raw = new.encode("utf-8")
+            kept.append((info, raw))
+
+    # Two-pass: rewrite META-INF/manifest.xml now that the dropped set is
+    # known. The manifest precedes the dropped parts in the archive, so a
+    # single pass cannot remove entries for parts dropped later in the loop.
+    if dropped:
+        rewritten: list[tuple[zipfile.ZipInfo, bytes]] = []
+        for info, part_raw in kept:
+            out_raw = part_raw
+            if info.filename == "META-INF/manifest.xml":
+                pruned, n = _prune_odt_manifest_entries(part_raw, dropped)
+                if n:
+                    actions.append(f"drop manifest entries x{n}")
+                    out_raw = pruned
+            rewritten.append((info, out_raw))
+        kept = rewritten
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info, raw in kept:
             zout.writestr(info, raw)
     if layer_removed or layer_replaced:
         actions.append(f"layer A text: removed={layer_removed} replaced={layer_replaced}")
@@ -1180,7 +1472,10 @@ def _epub_encrypted_parts(data: bytes) -> set[str]:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             if "META-INF/encryption.xml" not in zf.namelist():
                 return set()
-            xml = zf.read("META-INF/encryption.xml").decode("utf-8", errors="replace")
+            budget: list[int] = [0]
+            xml = _read_zip_member(zf, zf.getinfo("META-INF/encryption.xml"), budget).decode(
+                "utf-8", errors="replace"
+            )
     except (zipfile.BadZipFile, KeyError):
         return set()
     names: set[str] = set()
@@ -1209,7 +1504,7 @@ def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
                 if name in encrypted:
                     findings.append(f"{name}: encrypted content (skipped)")
                     continue
-                raw = zf.read(name)
+                raw = _read_zip_member(zf, info, budget)
                 if name.lower().endswith((".xhtml", ".html", ".htm")):
                     text = raw.decode("utf-8", errors="surrogateescape")
                     c2, ai, sub, _ = inspect_html(text)
@@ -1241,6 +1536,19 @@ def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(names)}
 
 
+# Open/close tag halves for the linear OPF scans in _scrub_epub_opf.
+_OPF_META_OPEN_RE = re.compile(r"<meta\b[^>]*>", re.I)
+_OPF_META_CLOSE_RE = re.compile(r"</meta\s*>", re.I)
+_DC_FIELDS_OPEN_RE = re.compile(
+    r"<(dc:(?:creator|contributor|publisher|description|rights|source))\b[^>]*>",
+    re.I,
+)
+_DC_FIELDS_CLOSE_RE = re.compile(
+    r"</(dc:(?:creator|contributor|publisher|description|rights|source))\s*>",
+    re.I,
+)
+
+
 def _scrub_epub_opf(text: str) -> tuple[str, list[str]]:
     """Scrub AI-ish metadata from the EPUB package document (OPF)."""
     actions: list[str] = []
@@ -1253,20 +1561,49 @@ def _scrub_epub_opf(text: str) -> tuple[str, list[str]]:
         return tag
 
     new = re.sub(r"<meta\b[^>]*/>", _meta, text, flags=re.I)
-    new = re.sub(r"<meta\b[^>]*>.*?</meta\s*>", _meta, new, flags=re.I | re.DOTALL)
 
-    def _dc(m: re.Match[str]) -> str:
-        if AI_META_NAME_RE.search(m.group(0)):
-            actions.append(f"scrub {m.group(1)} (AI vendor name)")
-            return f"<{m.group(1)}/>"
-        return m.group(0)
+    # Block-form <meta>...</meta> (linear scan; the lazy .*? form is
+    # quadratic on unclosed opening tags, see _iter_tag_blocks)
+    def _meta_block_is_ai(block: str) -> bool:
+        if AI_META_NAME_RE.search(block):
+            actions.append("drop OPF meta tag")
+            return True
+        return False
 
-    new = re.sub(
-        r"<(dc:(?:creator|contributor|publisher|description|rights|source))\b[^>]*>.*?</\1\s*>",
-        _dc,
-        new,
-        flags=re.I | re.DOTALL,
-    )
+    # The predicate itself records the per-block action, so the count is unused.
+    new, _n = _drop_blocks_if(new, _OPF_META_OPEN_RE, _OPF_META_CLOSE_RE, _meta_block_is_ai)
+
+    # dc:... provenance fields. The original pattern paired each opening tag
+    # with its backreferenced closing tag via a lazy .*? - quadratic on
+    # unclosed openings. Pair opens with same-name closes directly: linear,
+    # exact same match semantics (first same-name close at/after the open).
+    out = []
+    last = 0
+    dc_closes: dict[str, list[re.Match[str]]] = {}
+    for m in re.finditer(_DC_FIELDS_CLOSE_RE, new):
+        dc_closes.setdefault(m.group(1), []).append(m)
+    ptr: dict[str, int] = {name: 0 for name in dc_closes}
+    for om in re.finditer(_DC_FIELDS_OPEN_RE, new):
+        name = om.group(1)
+        if om.start() < last:
+            continue
+        closes = dc_closes.get(name, ())
+        i = ptr.get(name, 0)
+        while i < len(closes) and closes[i].start() < om.end():
+            i += 1
+        ptr[name] = i
+        if i >= len(closes):
+            continue  # no same-name close - block never matches (kept)
+        cm = closes[i]
+        block = new[om.start() : cm.end()]
+        if AI_META_NAME_RE.search(block):
+            out.append(new[last : om.start()])
+            out.append(f"<{name}/>")
+            last = cm.end()
+            actions.append(f"scrub {name} (AI vendor name)")
+    if last:
+        out.append(new[last:])
+        new = "".join(out)
 
     if not actions:
         actions.append("no OPF metadata removed")
@@ -1281,7 +1618,8 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
     fonts) are kept so the book stays readable. Parts listed in
     META-INF/encryption.xml are copied verbatim — their bytes are ciphertext,
     so any rewrite would corrupt them. Non-content parts carrying AI/C2PA
-    markers are dropped.
+    markers are dropped, and the OPF manifest is pruned afterwards so no
+    dropped part stays referenced.
     """
     from text_unicode import clean_text  # local import to avoid cycles
 
@@ -1290,20 +1628,18 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
     layer_removed = 0
     layer_replaced = 0
     encrypted = _epub_encrypted_parts(data)
-    out_buf = io.BytesIO()
-    with (
-        zipfile.ZipFile(io.BytesIO(data)) as zin,
-        zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout,
-    ):
+    kept: list[tuple[zipfile.ZipInfo, bytes]] = []
+    dropped: set[str] = set()
+    with zipfile.ZipFile(io.BytesIO(data)) as zin:
         for info in zin.infolist():
-            name = info.filename
             _check_zip_budget(info, budget)
-            raw = zin.read(name)
+            name = info.filename
+            raw = _read_zip_member(zin, info, budget)
             low = name.lower()
 
             # Encrypted parts are opaque ciphertext: pass through untouched.
             if name in encrypted:
-                zout.writestr(info, raw)
+                kept.append((info, raw))
                 continue
 
             # 1. Embedded raster / vector media: strip metadata
@@ -1333,7 +1669,7 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
                 if any("drop" in a.lower() for a in sub_actions) and cleaned != raw:
                     actions.append(f"clean embedded media in {name} ({', '.join(sub_actions[:2])})")
                     raw = cleaned
-                zout.writestr(info, raw)
+                kept.append((info, raw))
                 continue
 
             # 2. XHTML content: strip AI meta/JSON-LD, then Layer A
@@ -1349,7 +1685,7 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
                         layer_replaced += stats["replaced_count"]
                         text = text2
                 raw = text.encode("utf-8", errors="surrogateescape")
-                zout.writestr(info, raw)
+                kept.append((info, raw))
                 continue
 
             # 3. Package document (OPF): scrub AI-ish metadata
@@ -1359,19 +1695,38 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
                 if sub_actions and sub_actions != ["no OPF metadata removed"]:
                     actions.extend(f"{name}: {a}" for a in sub_actions)
                 raw = new_text.encode("utf-8", errors="surrogateescape")
-                zout.writestr(info, raw)
+                kept.append((info, raw))
                 continue
 
             # 4. Other parts: drop non-content parts carrying AI/C2PA markers
             c2, ai, _hits = _blob_hits(raw)
             if (c2 or ai) and not _epub_content_part(name):
                 actions.append(f"drop part {name} (AI/C2PA markers)")
+                dropped.add(name)
                 continue
 
             # 5. mimetype must stay first and stored — it already is, since we
             #    write in the original entry order; force stored compression.
             if low == "mimetype":
                 info.compress_type = zipfile.ZIP_STORED
+            kept.append((info, raw))
+
+    # Two-pass: prune the OPF manifest now that the dropped set is known.
+    if dropped:
+        rewritten: list[tuple[zipfile.ZipInfo, bytes]] = []
+        for info, part_raw in kept:
+            out_raw = part_raw
+            if info.filename.lower().endswith(".opf"):
+                pruned, n = _prune_opf_manifest(part_raw, info.filename, dropped)
+                if n:
+                    actions.append(f"prune OPF manifest entries x{n}")
+                    out_raw = pruned
+            rewritten.append((info, out_raw))
+        kept = rewritten
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info, raw in kept:
             zout.writestr(info, raw)
 
     if layer_removed or layer_replaced:
@@ -1385,10 +1740,13 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
 # PDF
 # ---------------------------------------------------------------------------
 
-_XMP_PACKET_RE = re.compile(
-    rb"<\?xpacket begin.*?<\?xpacket end[^?]*\?>",
-    re.I | re.DOTALL,
-)
+# Open/close halves for the linear XMP packet scan below. The lazy
+# ".*?</\?xpacket end..." form was quadratic on a flood of "<?xpacket begin"
+# markers with no end marker.
+_XMP_PACKET_OPEN_RE = re.compile(rb"<\?xpacket begin", re.I)
+_XMP_PACKET_CLOSE_RE = re.compile(rb"<\?xpacket end[^?]*\?>", re.I)
+_PDF_STREAM_OPEN_RE = re.compile(rb"stream\r?\n")
+_PDF_STREAM_CLOSE_RE = re.compile(rb"endstream")
 
 
 def _pdf_structured_blob(data: bytes) -> bytes:
@@ -1398,13 +1756,18 @@ def _pdf_structured_blob(data: bytes) -> bytes:
     sequence (e.g. "AIGC") can occur by chance. Scanning only dictionaries and
     XMP packets avoids treating those collisions as metadata findings.
     """
-    no_streams = re.sub(
-        rb"stream\r?\n.*?endstream",
-        b"stream endstream",
-        data,
-        flags=re.DOTALL,
+    parts = []
+    last = 0
+    for os_, _oe, _cs, ce in _iter_tag_blocks(data, _PDF_STREAM_OPEN_RE, _PDF_STREAM_CLOSE_RE):
+        parts.append(data[last:os_])
+        parts.append(b"stream endstream")
+        last = ce
+    parts.append(data[last:])
+    no_streams = b"".join(parts)
+    xmp = b"\n".join(
+        data[os_:ce]
+        for os_, _oe, _cs, ce in _iter_tag_blocks(data, _XMP_PACKET_OPEN_RE, _XMP_PACKET_CLOSE_RE)
     )
-    xmp = b"\n".join(_XMP_PACKET_RE.findall(data))
     return no_streams + b"\n" + xmp
 
 
@@ -1413,7 +1776,10 @@ def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
     findings.extend(f"pdf-structured:{h}" for h in hits)
     # XMP packet scan
-    xmp_blob = b"\n".join(_XMP_PACKET_RE.findall(data))
+    xmp_blob = b"\n".join(
+        data[os_:ce]
+        for os_, _oe, _cs, ce in _iter_tag_blocks(data, _XMP_PACKET_OPEN_RE, _XMP_PACKET_CLOSE_RE)
+    )
     if xmp_blob:
         findings.append("XMP packet present")
         has_ai = has_ai or bool(
@@ -1514,13 +1880,9 @@ def clean_pdf(path: Path, dest: Path) -> tuple[list[str], dict]:
         return actions, {"mode": "exiftool", "structural_rewrite": rewritten}
 
     # Degraded: strip obvious XMP packets between <?xpacket begin and end
+    # (linear scan - the lazy .*? form is quadratic on unclosed begin markers)
     text = data
-    new, n = re.subn(
-        rb"<\?xpacket begin.*?<\?xpacket end[^?]*\?>",
-        b"",
-        text,
-        flags=re.I | re.DOTALL,
-    )
+    new, n = _drop_tag_blocks(text, _XMP_PACKET_OPEN_RE, _XMP_PACKET_CLOSE_RE)
     if n:
         actions.append(f"stripped XMP xpacket x{n} (degraded; may leave offsets broken)")
         # PDF structural risk: document degraded mode clearly
@@ -1589,6 +1951,7 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         from text_unicode import inspect_text  # local import to avoid cycles
 
         encrypted = _epub_encrypted_parts(data)
+        budget: list[int] = [0]
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 for info in zf.infolist():
@@ -1596,7 +1959,9 @@ def inspect_container(path: Path) -> ContainerInspectReport:
                         continue
                     if info.filename.lower().endswith((".xhtml", ".html", ".htm")):
                         ta = inspect_text(
-                            zf.read(info.filename).decode("utf-8", errors="surrogateescape")
+                            _read_zip_member(zf, info, budget).decode(
+                                "utf-8", errors="surrogateescape"
+                            )
                         ).to_dict()
                         layer_a_total += ta["suspicious_total"]
                         for h in ta["hits"]:

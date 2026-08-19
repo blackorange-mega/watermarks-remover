@@ -45,6 +45,7 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
 
 COPY scripts/requirements-synthid-scorer.txt /app/requirements-synthid-scorer.txt
 COPY scripts/score_synthid.py /app/score_synthid.py
+COPY scripts/synthid_score_server.py /app/synthid_score_server.py
 
 RUN python3 -m pip install --no-cache-dir "pip==26.2.1" \
     && python3 -m pip install --no-cache-dir -r /app/requirements-synthid-scorer.txt

@@ -24,9 +24,12 @@ from container_meta import (
     clean_markdown,
     clean_odt,
     clean_svg,
+    detect_container_format,
     inspect_container,
+    inspect_docx,
     inspect_html,
     inspect_markdown,
+    inspect_odt,
     inspect_svg,
 )
 
@@ -552,6 +555,78 @@ def test_odt_drops_generator(tmp_path: Path):
         assert "meta:generator" not in meta or "Anthropic" not in meta
 
 
+def _make_odt_with_manifest(manifest_entries: list[str], extra_parts: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    manifest = (
+        '<?xml version="1.0"?><manifest:manifest '
+        'xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
+        + "".join(manifest_entries)
+        + "</manifest:manifest>"
+    )
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+        zf.writestr("content.xml", b'<?xml version="1.0"?><office:document-content/>')
+        zf.writestr("META-INF/manifest.xml", manifest)
+        for name, payload in extra_parts.items():
+            zf.writestr(name, payload)
+    return buf.getvalue()
+
+
+def test_odt_dropped_part_removes_manifest_entry():
+    """Dropping a marker-bearing part must also drop its manifest entry,
+    or readers flag the package as damaged."""
+    data = _make_odt_with_manifest(
+        [
+            '<manifest:file-entry manifest:media-type="application/vnd.oasis.opendocument.text" manifest:full-path="/"/>',
+            '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>',
+            '<manifest:file-entry manifest:media-type="application/octet-stream" manifest:full-path="custommeta.xml"/>',
+        ],
+        extra_parts={"custommeta.xml": b"<meta><creator>Anthropic Claude</creator></meta>"},
+    )
+    cleaned, actions = clean_odt(data)
+    assert any("drop part custommeta.xml" in a for a in actions)
+    assert any("drop manifest entries" in a for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        assert zf.namelist().count("META-INF/manifest.xml") == 1
+        manifest = zf.read("META-INF/manifest.xml").decode()
+        assert "custommeta.xml" not in manifest
+        assert 'full-path="content.xml"' in manifest
+        assert 'full-path="/"' in manifest
+
+
+def test_odt_manifest_rewrite_is_attribute_order_independent():
+    """The dropped entry has full-path before media-type; matching must not
+    depend on attribute order."""
+    data = _make_odt_with_manifest(
+        [
+            '<manifest:file-entry manifest:full-path="/"/>',
+            '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>',
+            '<manifest:file-entry manifest:full-path="custommeta.xml" manifest:media-type="application/octet-stream"/>',
+        ],
+        extra_parts={"custommeta.xml": b"<meta><creator>Anthropic Claude</creator></meta>"},
+    )
+    cleaned, _actions = clean_odt(data)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        manifest = zf.read("META-INF/manifest.xml").decode()
+        assert "custommeta.xml" not in manifest
+        assert 'full-path="content.xml"' in manifest
+
+
+def test_odt_manifest_untouched_when_nothing_dropped():
+    data = _make_odt_with_manifest(
+        [
+            '<manifest:file-entry manifest:media-type="application/vnd.oasis.opendocument.text" manifest:full-path="/"/>',
+            '<manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>',
+        ],
+        extra_parts={},
+    )
+    cleaned, actions = clean_odt(data)
+    assert not any("manifest" in a for a in actions)
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        manifest = zf.read("META-INF/manifest.xml").decode()
+        assert 'full-path="content.xml"' in manifest
+
+
 def test_clean_container_markdown_file(tmp_path: Path):
     src = tmp_path / "x.md"
     src.write_text("---\ngenerator: OpenAI\n---\nHi\u200b\n", encoding="utf-8")
@@ -692,3 +767,27 @@ def test_clean_file_in_place_for_every_container_ext(tmp_path: Path, ext: str, m
         data["format"]
         == {"docx": "docx", "odt": "odt", "svg": "svg", "md": "markdown", "html": "html"}[ext]
     )
+
+
+def test_container_inspectors_survive_malformed_zip():
+    # A truncated or garbage container degrades to a clear finding instead of
+    # raising, for docx, odt, and format detection.
+    truncated = bytes([0x50, 0x4B, 0x03, 0x04]) + bytes(8)
+    garbage = b"not a zip at all"
+    for data in (truncated, garbage):
+        assert inspect_docx(data) == (False, False, ["not a valid DOCX zip"], {})
+        assert inspect_odt(data) == (False, False, ["not a valid ODT zip"], {})
+        assert detect_container_format(Path("x.bin"), data) == "unknown"
+
+
+def test_zip_budget_rejection_propagates_from_inspect(monkeypatch):
+    # A refused zip bomb must propagate the same way it does out of clean_*,
+    # not be reported as an unparseable container.
+    import container_meta
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("word/document.xml", "<w:document/>")
+    monkeypatch.setattr(container_meta, "MAX_ZIP_DECOMPRESSED_BYTES", 1)
+    with pytest.raises(container_meta.ZipBudgetExceeded):
+        inspect_docx(buf.getvalue())

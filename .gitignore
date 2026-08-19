@@ -4,6 +4,8 @@
 /*
 !/.github/
 !/.github/**
+!/benchmarks/
+!/benchmarks/**
 !/docs/
 !/docs/**
 !/service/
@@ -15,6 +17,7 @@
 !/.dockerignore
 !/.env.example
 !/.gitignore
+!/.pre-commit-hooks.yaml
 !/CODE_OF_CONDUCT.md
 !/compose-check.sh
 !/compose.yaml

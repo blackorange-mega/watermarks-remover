@@ -78,6 +78,7 @@ if [[ ! -d "$DIR/.git" ]]; then
     '/config/' \
     '/utils/' \
     '/exceptions/' \
+    '/visualize/' \
     '/evaluation/dataset.py' \
     '/LICENSE' \
     '/README.md'
