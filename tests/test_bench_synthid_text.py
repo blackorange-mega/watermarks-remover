@@ -58,6 +58,8 @@ def _args(**overrides):
         cost_per_mtok_in=0.0,
         cost_per_mtok_out=0.0,
         no_worker=True,
+        scheme="synthid",
+        config=None,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -515,8 +517,8 @@ def test_worker_publishes_port_env(tmp_path, monkeypatch):
     """A live worker publishes WATERMARKS_MARKLLM_PORT for child processes."""
 
     class _PortWorker(_FakeWorker):
-        def __init__(self, python, script, upstream, model, timeout):
-            super().__init__(python, script, upstream, model, timeout)
+        def __init__(self, python, script, upstream, model, timeout, **kwargs):
+            super().__init__(python, script, upstream, model, timeout, **kwargs)
             self.port = 12345
             os.environ["WATERMARKS_MARKLLM_PORT"] = str(self.port)
 
@@ -566,7 +568,7 @@ def test_aggregate_tolerates_list_in_notes():
 class _FakeWorker:
     info: dict = {"device": "cuda"}  # noqa: RUF012 - test double
 
-    def __init__(self, python, script, upstream, model, timeout):
+    def __init__(self, python, script, upstream, model, timeout, *, scheme="synthid", config=None):
         pass
 
     def watermark(self, prompt, seed, max_new_tokens):
@@ -611,7 +613,7 @@ def test_worker_fallback_on_start_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(bench, "MarkLLMWorker", _Boom)
     calls = []
 
-    def fake_detect(py, script, upstream, text, model, timeout):
+    def fake_detect(py, script, upstream, text, model, timeout, *, scheme="synthid", config=None):
         calls.append(text)
         return dict(DETECT_NEG)
 

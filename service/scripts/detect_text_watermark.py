@@ -5,8 +5,8 @@ This script does NOT vendor upstream code. It imports ``AutoWatermark`` from a
 user-provided checkout (https://github.com/THU-BPM/MarkLLM) at runtime, using
 that environment's optional dependencies (torch, transformers, datasets, ...).
 
-MarkLLM is Apache-2.0. It is a research/verification harness: detection is only
-valid against the SAME scheme config + keys used at generation. It cannot
+MarkLLM is Apache-2.0. It is an independent verification harness: detection is
+only valid against the SAME scheme config + keys used at generation. It cannot
 certify that a vendor detector will fail on the given text.
 
 Subcommands:
@@ -39,10 +39,15 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from common import emit_json, eprint, read_text_input, safe_write_text  # noqa: E402
 
 # Scheme name as the user types it -> MarkLLM algorithm name (config/{ALG}.json).
+# All schemes ship configs in the MarkLLM checkout; SIR additionally needs
+# its transform/embedding models downloaded per the MarkLLM README.
 SCHEMES = {
     "kgw": "KGW",
     "synthid": "SynthID",
     "synthid-text": "SynthID",
+    "exp": "EXP",
+    "unigram": "Unigram",
+    "sir": "SIR",
 }
 
 DEFAULT_MODEL = "facebook/opt-1.3b"
@@ -84,9 +89,25 @@ def resolve_device(raw: str | None) -> str:
 
 
 def _load_algorithm(
-    upstream: Path, alg: str, config: Path, model: str, device: str, offline: bool = False
+    upstream: Path,
+    alg: str,
+    config: Path,
+    model: str,
+    device: str,
+    offline: bool = False,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ):
-    """Import the checkout and build an ``AutoWatermark`` instance."""
+    """Import the checkout and build an ``AutoWatermark`` instance.
+
+    ``temperature``/``top_p`` (when not None) are folded into the generation
+    kwargs so callers can control sampling.
+    """
+    gen_kwargs_extra: dict[str, float] = {}
+    if temperature is not None:
+        gen_kwargs_extra["temperature"] = temperature
+    if top_p is not None:
+        gen_kwargs_extra["top_p"] = top_p
     sys.path.insert(0, str(upstream))
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -114,6 +135,7 @@ def _load_algorithm(
         min_length=0,
         do_sample=True,
         no_repeat_ngram_size=4,
+        **gen_kwargs_extra,
     )
     return AutoWatermark.load(
         alg,
@@ -194,7 +216,16 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     try:
         config = _resolve_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
-        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
+        wm = _load_algorithm(
+            upstream,
+            alg,
+            config,
+            args.model,
+            device,
+            offline=args.offline,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
         det = _detect_payload(wm, text, threshold)
     except _Unavailable as e:
         eprint(str(e))
@@ -236,7 +267,16 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
 
     try:
         config = _resolve_config(upstream, alg, args.config)
-        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
+        wm = _load_algorithm(
+            upstream,
+            alg,
+            config,
+            args.model,
+            device,
+            offline=args.offline,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
         watermarked, unwatermarked = _generate(
             wm,
             prompt,
@@ -264,6 +304,8 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
         "config": str(config),
         "model": args.model,
         "device": device,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
         "watermarked_output": wm_out,
         "unwatermarked_output": args.unwatermarked_output,
         "watermarked_chars": len(watermarked),
@@ -291,6 +333,11 @@ def _handle_serve_request(wm: Any, req: dict[str, Any], threshold: float | None)
             prompt = req.get("prompt")
             if not isinstance(prompt, str) or not prompt:
                 raise ValueError("'prompt' must be a non-empty string")
+            # Per-request generation knobs.
+            for key in ("temperature", "top_p"):
+                value = req.get(key)
+                if isinstance(value, (int, float)):
+                    wm.config.gen_kwargs[key] = float(value)
             watermarked, unwatermarked = _generate(
                 wm,
                 prompt,
@@ -326,9 +373,13 @@ def _cmd_serve(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     torch + model load cost per call. Protocol:
 
       request:  {"op": "watermark", "id": N, "prompt": str, "seed": int|None,
-                 "max_new_tokens": int, "min_length": int}
+                 "max_new_tokens": int, "min_length": int,
+                 "temperature": float|None, "top_p": float|None}
                 {"op": "detect", "id": N, "text": str}
                 {"op": "exit", "id": N}
+
+    Per-request "temperature"/"top_p" override the worker's generation kwargs;
+    omitted keys keep the current value.
       response: {"ok": true, "id": N, ...} | {"ok": false, "id": N, "error": str}
 
     The first stdout line is a {"ready": true, ...} handshake emitted after
@@ -338,7 +389,16 @@ def _cmd_serve(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     try:
         config = _resolve_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
-        wm = _load_algorithm(upstream, alg, config, args.model, device, offline=args.offline)
+        wm = _load_algorithm(
+            upstream,
+            alg,
+            config,
+            args.model,
+            device,
+            offline=args.offline,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
     except _Unavailable as e:
         eprint(str(e))
         return 3
@@ -349,7 +409,14 @@ def _cmd_serve(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     def respond(payload: dict[str, Any]) -> None:
         print(json.dumps(payload), flush=True)
 
-    ready: dict[str, Any] = {"ready": True, "scheme": alg, "model": args.model, "device": device}
+    ready: dict[str, Any] = {
+        "ready": True,
+        "scheme": alg,
+        "model": args.model,
+        "device": device,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+    }
     lock = threading.Lock()
     server: socketserver.ThreadingTCPServer | None = None
     if args.port >= 0:
@@ -440,6 +507,18 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--config",
         default=None,
         help="Algorithm config JSON (default: <checkout>/config/<ALG>.json)",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Generation temperature (default: unset -> MarkLLM/HF default)",
+    )
+    p.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Generation nucleus-sampling top-p (default: unset -> MarkLLM/HF default)",
     )
     p.add_argument(
         "--model",
